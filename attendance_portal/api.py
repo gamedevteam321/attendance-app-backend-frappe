@@ -350,7 +350,7 @@ def mark_punch(employee, lat, lng, action):
             check_out_time = get_datetime(attendance_log.check_out)
             duration_hours = (check_out_time - check_in_time).total_seconds() / 3600
             
-            if duration_hours < 4:
+            if duration_hours < 9:
                 attendance_log.status = "Half Day"
             else:
                 attendance_log.status = "Present"
@@ -1594,7 +1594,6 @@ def get_attendance_logs(employee=None, month=None, year=None):
     return logs
 
 @frappe.whitelist()
-@frappe.whitelist()
 def apply_for_regularization(employee=None, attendance_date=None, check_in=None, check_out=None, reason=None):
     """
     Create an Attendance Regularization Request
@@ -1676,3 +1675,85 @@ def get_regularization_requests(employee=None):
     )
     
     return requests
+
+@frappe.whitelist()
+def get_holidays_for_month(employee=None, month=None, year=None):
+    """
+    Get holidays for an employee for a specific month from the company's holiday list
+    
+    Args:
+        employee: Employee ID (optional, defaults to current user's employee)
+        month: Month number (1-12)
+        year: Year (e.g., 2024)
+    
+    Returns:
+        list: List of holiday dates in YYYY-MM-DD format
+    """
+    from datetime import datetime
+    import calendar
+    
+    current_user = frappe.session.user
+    
+    # If employee is not provided, get employee for current user
+    if not employee:
+        employee = frappe.db.get_value("Employee", {"user_id": current_user}, "name")
+        if not employee:
+            return []
+    
+    # Validate that employee belongs to current user
+    employee_user = frappe.db.get_value("Employee", employee, "user_id")
+    if employee_user != current_user:
+        frappe.throw(_("You can only view your own holidays"))
+    
+    # Get employee's company
+    company = frappe.db.get_value("Employee", employee, "company")
+    if not company:
+        return []
+    
+    # Get holiday list from company's default_holiday_list
+    holiday_list = frappe.get_cached_value("Company", company, "default_holiday_list")
+    if not holiday_list:
+        # Fallback: try to get from employee's holiday_list field
+        holiday_list = frappe.db.get_value("Employee", employee, "holiday_list")
+        if not holiday_list:
+            print(f"DEBUG: No holiday list found for company {company} or employee {employee}")
+            return []
+    
+    # Calculate start and end dates for the month
+    if not month or not year:
+        now = datetime.now()
+        month = now.month
+        year = now.year
+    
+    # Get first and last day of month
+    _, last_day = calendar.monthrange(int(year), int(month))
+    start_date = f"{year}-{int(month):02d}-01"
+    end_date = f"{year}-{int(month):02d}-{last_day}"
+    
+    # Get holidays for the month
+    holidays = frappe.get_all(
+        "Holiday",
+        filters={
+            "parent": holiday_list,
+            "holiday_date": ["between", [start_date, end_date]]
+        },
+        fields=["holiday_date"],
+        order_by="holiday_date asc"
+    )
+    
+    # Return list of holiday dates as strings in YYYY-MM-DD format
+    holiday_dates = []
+    for h in holidays:
+        if h.holiday_date:
+            # Convert to string format YYYY-MM-DD
+            if isinstance(h.holiday_date, str):
+                # If it's already a string, use it directly (might be in YYYY-MM-DD format)
+                holiday_dates.append(h.holiday_date.split(' ')[0])  # Take date part if time included
+            else:
+                # It's a date object, format it
+                holiday_dates.append(h.holiday_date.strftime("%Y-%m-%d"))
+    
+    print(f"DEBUG: get_holidays_for_month - employee={employee}, company={company}, holiday_list={holiday_list}, month={month}, year={year}")
+    print(f"DEBUG: Found {len(holiday_dates)} holidays: {holiday_dates}")
+    
+    return holiday_dates
