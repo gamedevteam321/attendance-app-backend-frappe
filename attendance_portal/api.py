@@ -1293,7 +1293,42 @@ def get_notifications(limit=20):
     # Sort by timestamp descending
     notifications.sort(key=lambda x: x["timestamp"], reverse=True)
     
+    # Get read notification IDs for current user
+    read_notifications = frappe.cache.hget("read_notifications", current_user) or []
+    if not isinstance(read_notifications, list):
+        read_notifications = []
+    
+    # Mark notifications as read/unread based on stored read status
+    for notification in notifications:
+        notification["unread"] = notification["id"] not in read_notifications
+    
     return notifications[:limit]
+
+@frappe.whitelist()
+def mark_notification_as_read(notification_id):
+    """
+    Mark a notification as read for the current user
+    
+    Args:
+        notification_id: The ID of the notification to mark as read
+    
+    Returns:
+        dict: Success message
+    """
+    current_user = frappe.session.user
+    
+    # Get existing read notifications
+    read_notifications = frappe.cache.hget("read_notifications", current_user) or []
+    if not isinstance(read_notifications, list):
+        read_notifications = []
+    
+    # Add notification ID if not already in list
+    if notification_id not in read_notifications:
+        read_notifications.append(notification_id)
+        # Store in cache
+        frappe.cache.hset("read_notifications", current_user, read_notifications)
+    
+    return {"message": "Notification marked as read"}
 
 
 @frappe.whitelist()
