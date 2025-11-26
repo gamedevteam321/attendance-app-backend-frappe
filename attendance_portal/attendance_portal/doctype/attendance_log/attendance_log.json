@@ -125,7 +125,7 @@
             "fieldtype": "Select",
             "in_list_view": 1,
             "label": "Status",
-            "options": "Present\nAbsent\nHalf Day"
+            "options": "Present\nAbsent\nHalf Day\nPending Approval"
         },
         {
             "fieldname": "working_hours",

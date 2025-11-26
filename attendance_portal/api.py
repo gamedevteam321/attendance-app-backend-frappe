@@ -6,6 +6,7 @@ All methods are whitelisted for frontend access via frappe-react-sdk
 import frappe
 from frappe import _
 from frappe.utils import today, now_datetime, get_datetime
+from frappe.model.rename_doc import rename_doc
 from datetime import datetime
 import math
 
@@ -145,7 +146,7 @@ def is_inside_office(employee, lat, lng):
 @frappe.whitelist()
 def has_remote_for_date(employee, date):
     """
-    Check if employee has approved remote work for given date
+    Check if employee has remote work (pending or approved) for given date
     
     Args:
         employee: Employee ID
@@ -154,30 +155,44 @@ def has_remote_for_date(employee, date):
     Returns:
         dict: {
             has_remote: bool,
-            request_name: str | None
+            request_name: str | None,
+            request_status: str | None  # "Pending", "Approved", or None
         }
     """
-    # Find approved remote working requests that cover this date
+    # Find remote working requests (both pending and approved) that cover this date
+    # Get all matching requests
     requests = frappe.get_all(
         "Remote Working Request",
         filters={
             "employee": employee,
-            "status": "Approved",
+            "status": ["in", ["Pending", "Approved"]],
             "from_date": ["<=", date],
             "to_date": [">=", date]
         },
-        fields=["name", "from_date", "to_date"]
+        fields=["name", "from_date", "to_date", "status"]
     )
     
     if requests:
-        return {
-            "has_remote": True,
-            "request_name": requests[0].name
-        }
+        # Prioritize Approved over Pending
+        approved_request = next((r for r in requests if r.status == "Approved"), None)
+        if approved_request:
+            return {
+                "has_remote": True,
+                "request_name": approved_request.name,
+                "request_status": approved_request.status
+            }
+        else:
+            # Return pending request
+            return {
+                "has_remote": True,
+                "request_name": requests[0].name,
+                "request_status": requests[0].status
+            }
     
     return {
         "has_remote": False,
-        "request_name": None
+        "request_name": None,
+        "request_status": None
     }
 
 
@@ -207,36 +222,37 @@ def mark_punch(employee, lat, lng, action):
     attendance_date = today()
     now_time = now_datetime()
     
-    # Check if employee has remote work approved for today
+    # Check if employee has remote work (pending or approved) for today
     remote_check = has_remote_for_date(employee, attendance_date)
     
     location_type = None
     office_location = None
     remote_req = None
+    remote_status = None
     
     if remote_check["has_remote"]:
-        location_type = "Remote"
+        # User has remote work request (pending or approved)
         remote_req = remote_check["request_name"]
-    else:
-        # Check if inside office ONLY for IN action
-        # For OUT action, we allow from anywhere
-        if action == "IN":
-            office_check = is_inside_office(employee, lat, lng)
-            
-            if not office_check["inside"]:
-                frappe.throw(_("You are not within any allowed office location. Distance from nearest office may be too far. Please request remote work if working remotely."))
-            
-            location_type = "Office"
+        remote_status = remote_check["request_status"]
+        location_type = "Remote"
+        
+        # For remote work, allow punch IN and OUT from anywhere
+        # Still check if they happen to be in office for record keeping
+        office_check = is_inside_office(employee, lat, lng)
+        if office_check["inside"]:
             office_location = office_check["office"]
-        else:
-            # For OUT, we just record where they are, but don't validate strict office bounds
-            # However, we can still check if they happen to be in an office for the record
-            office_check = is_inside_office(employee, lat, lng)
-            if office_check["inside"]:
-                location_type = "Office"
-                office_location = office_check["office"]
+    else:
+        # No remote request - must follow office location rules
+        office_check = is_inside_office(employee, lat, lng)
+        
+        if not office_check["inside"]:
+            if action == "IN":
+                frappe.throw(_("You are not within any allowed office location. Please request remote work if working remotely."))
             else:
-                location_type = "Remote" # Or "Field" / "Unknown"
+                frappe.throw(_("You must be within an office location to punch out when not working remotely."))
+        
+        location_type = "Office"
+        office_location = office_check["office"]
 
     if action == "IN":
         # Check if there's already an attendance log for today
@@ -248,20 +264,43 @@ def mark_punch(employee, lat, lng, action):
         if attendance_log_name:
             attendance_log = frappe.get_doc("Attendance Log", attendance_log_name)
             
-            # If already punched in (check_out is None), throw error
+            # If already punched in (check_out is None)
             if not attendance_log.check_out:
-                 frappe.throw(_("You have already punched in today. Please punch out first."), exc=frappe.exceptions.DuplicateEntryError)
-            
-            # Re-punching IN: Reset check_out and update check_in
-            attendance_log.check_out = None
-            attendance_log.check_out_lat = None
-            attendance_log.check_out_lng = None
-            attendance_log.check_in = now_time
-            attendance_log.check_in_lat = lat
-            attendance_log.check_in_lng = lng
-            attendance_log.location_type = location_type
-            attendance_log.office_location = office_location
-            attendance_log.status = "Present"
+                # Allow updating punch-in if:
+                # 1. Status is "Pending Approval" AND
+                # 2. Remote request is pending
+                # This allows users to update their punch-in time when remote request is pending
+                if attendance_log.status == "Pending Approval" and remote_status == "Pending":
+                    # Update the existing punch-in with new time and location
+                    attendance_log.check_in = now_time
+                    attendance_log.check_in_lat = lat
+                    attendance_log.check_in_lng = lng
+                    attendance_log.location_type = location_type
+                    attendance_log.office_location = office_location
+                    attendance_log.working_remote_req = remote_req
+                    attendance_log.status = "Pending Approval"
+                else:
+                    # Otherwise, throw error - user must punch out first
+                    frappe.throw(_("You have already punched in today. Please punch out first."), exc=frappe.exceptions.DuplicateEntryError)
+            else:
+                # Re-punching IN: Reset check_out and update check_in
+                attendance_log.check_out = None
+                attendance_log.check_out_lat = None
+                attendance_log.check_out_lng = None
+                attendance_log.check_in = now_time
+                attendance_log.check_in_lat = lat
+                attendance_log.check_in_lng = lng
+                attendance_log.location_type = location_type
+                attendance_log.office_location = office_location
+                attendance_log.working_remote_req = remote_req
+                
+                # Set status based on remote request approval status
+                if remote_status == "Pending":
+                    attendance_log.status = "Pending Approval"
+                elif remote_status == "Approved":
+                    attendance_log.status = "Present"
+                else:
+                    attendance_log.status = "Present"
             
         else:
             # Create new attendance log
@@ -275,7 +314,7 @@ def mark_punch(employee, lat, lng, action):
                 "check_in_lat": lat,
                 "check_in_lng": lng,
                 "working_remote_req": remote_req,
-                "status": "Present"
+                "status": "Pending Approval" if remote_status == "Pending" else "Present"
             })
             
     elif action == "OUT":
@@ -299,16 +338,22 @@ def mark_punch(employee, lat, lng, action):
         attendance_log.check_out_lat = lat
         attendance_log.check_out_lng = lng
         
-        # Calculate working hours (simple duration for now, but history tracking handles complex cases)
-        # Note: Total working hours calculation might need to sum up history intervals later
-        check_in_time = get_datetime(attendance_log.check_in)
-        check_out_time = get_datetime(attendance_log.check_out)
-        duration_hours = (check_out_time - check_in_time).total_seconds() / 3600
+        # Update office_location if available (for remote workers who punch out from office)
+        if office_location:
+            attendance_log.office_location = office_location
         
-        if duration_hours < 4:
-            attendance_log.status = "Half Day"
-        else:
-            attendance_log.status = "Present"
+        # Only update status if remote request is approved
+        # If pending, keep as "Pending Approval" - will be updated when manager approves
+        if attendance_log.status != "Pending Approval":
+            # Calculate working hours (simple duration for now, but history tracking handles complex cases)
+            check_in_time = get_datetime(attendance_log.check_in)
+            check_out_time = get_datetime(attendance_log.check_out)
+            duration_hours = (check_out_time - check_in_time).total_seconds() / 3600
+            
+            if duration_hours < 4:
+                attendance_log.status = "Half Day"
+            else:
+                attendance_log.status = "Present"
 
     else:
         frappe.throw(_("Invalid action. Must be 'IN' or 'OUT'"))
@@ -341,11 +386,13 @@ def mark_punch(employee, lat, lng, action):
             
     attendance_log.working_hours = round(total_hours, 2)
     
-    # Update status based on total hours
-    if attendance_log.working_hours < 4:
-        attendance_log.status = "Half Day"
-    else:
-        attendance_log.status = "Present"
+    # Don't update status to Present if it's Pending Approval
+    # Status will be updated when manager approves the remote request
+    if attendance_log.status != "Pending Approval":
+        if attendance_log.working_hours < 4:
+            attendance_log.status = "Half Day"
+        else:
+            attendance_log.status = "Present"
     
     attendance_log.save(ignore_permissions=True)
     frappe.db.commit()
@@ -576,9 +623,44 @@ def approve_request(doctype, name, status):
     if doctype == "Attendance Regularization Request" and status == "Approved":
         update_attendance_from_regularization(doc)
     
+    # If it's a Remote Working Request, update related attendance logs
+    if doctype == "Remote Working Request":
+        update_attendance_from_remote_approval(doc, status)
+    
     frappe.db.commit()
     
     return doc.as_dict()
+
+
+def update_attendance_from_remote_approval(remote_request, approval_status):
+    """
+    Update attendance logs when remote work request is approved or rejected
+    
+    Args:
+        remote_request: Remote Working Request document
+        approval_status: "Approved" or "Rejected"
+    """
+    # Find all attendance logs linked to this remote request
+    attendance_logs = frappe.get_all(
+        "Attendance Log",
+        filters={"working_remote_req": remote_request.name},
+        fields=["name", "attendance_date", "check_in", "check_out", "working_hours"]
+    )
+    
+    for log_data in attendance_logs:
+        attendance_log = frappe.get_doc("Attendance Log", log_data.name)
+        
+        if approval_status == "Approved":
+            # Calculate status based on working hours
+            if attendance_log.working_hours and attendance_log.working_hours < 4:
+                attendance_log.status = "Half Day"
+            else:
+                attendance_log.status = "Present"
+        elif approval_status == "Rejected":
+            # Mark as Absent when remote request is rejected
+            attendance_log.status = "Absent"
+        
+        attendance_log.save(ignore_permissions=True)
 
 
 def update_attendance_from_regularization(regularization_doc):
@@ -883,17 +965,42 @@ def get_employee_requests(doctype):
 
 
 @frappe.whitelist()
-def create_employee(first_name, last_name, email, password, designation, gender, date_of_birth, date_of_joining, company, reports_to, office):
+def create_employee(first_name, last_name, email, password, designation, gender, date_of_birth, date_of_joining, company, reports_to, office, roles=None):
     """
     Create a new User and Employee document.
+    
+    Args:
+        roles: List of user roles - must include "Employee", can also include "Manager" and/or "HR Admin"
+              If not provided, defaults to ["Employee"]
     """
     # Check permissions
     if "HR Admin" not in frappe.get_roles(frappe.session.user):
         frappe.throw(_("Not authorized"))
 
+    # Handle roles - default to Employee if not provided
+    if roles is None:
+        roles = ["Employee"]
+    
+    # If roles is a string (single role), convert to list
+    if isinstance(roles, str):
+        roles = [roles]
+    
+    # Validate that Employee role is always included
+    if "Employee" not in roles:
+        roles.append("Employee")
+    
+    # Validate all roles
+    valid_roles = ["Employee", "Manager", "HR Admin"]
+    for role in roles:
+        if role not in valid_roles:
+            frappe.throw(_("Invalid role: {0}. Must be one of: Employee, Manager, HR Admin").format(role))
+
     # 1. Create User
     if frappe.db.exists("User", email):
         frappe.throw(_("User with this email already exists"))
+    
+    # Prepare roles for user assignment
+    roles_to_assign = [{"role": role} for role in set(roles)]  # Use set to remove duplicates
         
     user = frappe.get_doc({
         "doctype": "User",
@@ -902,7 +1009,7 @@ def create_employee(first_name, last_name, email, password, designation, gender,
         "last_name": last_name,
         "send_welcome_email": 0,
         "enabled": 1,
-        "roles": [{"role": "Employee"}]
+        "roles": roles_to_assign
     })
     user.new_password = password
     user.insert(ignore_permissions=True)
@@ -923,6 +1030,19 @@ def create_employee(first_name, last_name, email, password, designation, gender,
         "allowed_locations": [{"office": office}]
     })
     employee.insert(ignore_permissions=True)
+    
+    # 3. Auto-assign Manager role to the person in reports_to if they don't have it
+    if reports_to:
+        manager_employee = frappe.get_doc("Employee", reports_to)
+        if manager_employee.user_id:
+            manager_user = frappe.get_doc("User", manager_employee.user_id)
+            manager_roles = [r.role for r in manager_user.roles]
+            
+            # If manager doesn't have Manager role, add it
+            if "Manager" not in manager_roles:
+                manager_user.append("roles", {"role": "Manager"})
+                manager_user.save(ignore_permissions=True)
+                frappe.db.commit()
     
     frappe.db.commit()
     
@@ -967,7 +1087,7 @@ def update_employee(employee_id, first_name, last_name, email, designation, repo
         
         # If email changed, update user_id in Employee
         if email != employee.user_id:
-            frappe.rename_doc("User", employee.user_id, email, ignore_permissions=True)
+            rename_doc("User", employee.user_id, email, ignore_permissions=True)
             employee.user_id = email
             employee.save(ignore_permissions=True)
 
