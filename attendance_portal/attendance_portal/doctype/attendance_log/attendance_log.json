@@ -1,0 +1,168 @@
+{
+    "actions": [],
+    "allow_rename": 1,
+    "autoname": "format:ATT-{employee}-{attendance_date}",
+    "creation": "2025-01-24 19:00:00.000000",
+    "doctype": "DocType",
+    "engine": "InnoDB",
+    "field_order": [
+        "employee",
+        "attendance_date",
+        "section_break_1",
+        "check_in",
+        "check_out",
+        "column_break_1",
+        "location_type",
+        "office_location",
+        "section_break_2",
+        "check_in_lat",
+        "check_in_lng",
+        "column_break_2",
+        "check_out_lat",
+        "check_out_lng",
+        "section_break_3",
+        "working_remote_req",
+        "status"
+    ],
+    "fields": [
+        {
+            "fieldname": "employee",
+            "fieldtype": "Link",
+            "in_list_view": 1,
+            "label": "Employee",
+            "options": "Employee",
+            "reqd": 1
+        },
+        {
+            "default": "Today",
+            "fieldname": "attendance_date",
+            "fieldtype": "Date",
+            "in_list_view": 1,
+            "label": "Attendance Date",
+            "reqd": 1
+        },
+        {
+            "fieldname": "section_break_1",
+            "fieldtype": "Section Break",
+            "label": "Check In/Out"
+        },
+        {
+            "fieldname": "check_in",
+            "fieldtype": "Datetime",
+            "in_list_view": 1,
+            "label": "Check In"
+        },
+        {
+            "fieldname": "check_out",
+            "fieldtype": "Datetime",
+            "in_list_view": 1,
+            "label": "Check Out"
+        },
+        {
+            "fieldname": "column_break_1",
+            "fieldtype": "Column Break"
+        },
+        {
+            "fieldname": "location_type",
+            "fieldtype": "Select",
+            "in_list_view": 1,
+            "label": "Location Type",
+            "options": "Office\nRemote"
+        },
+        {
+            "fieldname": "office_location",
+            "fieldtype": "Link",
+            "label": "Office Location",
+            "options": "Office Location"
+        },
+        {
+            "fieldname": "section_break_2",
+            "fieldtype": "Section Break",
+            "label": "Geolocation"
+        },
+        {
+            "fieldname": "check_in_lat",
+            "fieldtype": "Float",
+            "label": "Check In Latitude",
+            "precision": "8"
+        },
+        {
+            "fieldname": "check_in_lng",
+            "fieldtype": "Float",
+            "label": "Check In Longitude",
+            "precision": "8"
+        },
+        {
+            "fieldname": "column_break_2",
+            "fieldtype": "Column Break"
+        },
+        {
+            "fieldname": "check_out_lat",
+            "fieldtype": "Float",
+            "label": "Check Out Latitude",
+            "precision": "8"
+        },
+        {
+            "fieldname": "check_out_lng",
+            "fieldtype": "Float",
+            "label": "Check Out Longitude",
+            "precision": "8"
+        },
+        {
+            "fieldname": "section_break_3",
+            "fieldtype": "Section Break",
+            "label": "Additional Info"
+        },
+        {
+            "fieldname": "working_remote_req",
+            "fieldtype": "Link",
+            "label": "Remote Working Request",
+            "options": "Remote Working Request"
+        },
+        {
+            "default": "Present",
+            "fieldname": "status",
+            "fieldtype": "Select",
+            "in_list_view": 1,
+            "label": "Status",
+            "options": "Present\nAbsent\nHalf Day"
+        },
+        {
+            "fieldname": "working_hours",
+            "fieldtype": "Float",
+            "label": "Working Hours",
+            "read_only": 1
+        },
+        {
+            "fieldname": "punch_history",
+            "fieldtype": "Table",
+            "label": "Punch History",
+            "options": "Attendance Punch History"
+        }
+    ],
+    "module": "Attendance Portal",
+    "name": "Attendance Log",
+    "naming_rule": "Expression",
+    "permissions": [
+        {
+            "if_owner": 1,
+            "read": 1,
+            "role": "Employee"
+        },
+        {
+            "read": 1,
+            "role": "Manager"
+        },
+        {
+            "create": 1,
+            "delete": 1,
+            "read": 1,
+            "role": "HR Admin",
+            "write": 1
+        }
+    ],
+    "sort_field": "modified",
+    "sort_order": "DESC",
+    "states": [],
+    "track_changes": 1
+}

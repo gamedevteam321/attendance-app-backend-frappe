@@ -1,0 +1,68 @@
+{
+    "actions": [],
+    "allow_rename": 1,
+    "creation": "2025-01-25 12:00:00.000000",
+    "doctype": "DocType",
+    "editable_grid": 1,
+    "engine": "InnoDB",
+    "field_order": [
+        "punch_type",
+        "punch_time",
+        "location_type",
+        "office_location",
+        "latitude",
+        "longitude"
+    ],
+    "fields": [
+        {
+            "fieldname": "punch_type",
+            "fieldtype": "Select",
+            "in_list_view": 1,
+            "label": "Punch Type",
+            "options": "IN\nOUT",
+            "reqd": 1
+        },
+        {
+            "fieldname": "punch_time",
+            "fieldtype": "Datetime",
+            "in_list_view": 1,
+            "label": "Punch Time",
+            "reqd": 1
+        },
+        {
+            "fieldname": "location_type",
+            "fieldtype": "Data",
+            "in_list_view": 1,
+            "label": "Location Type"
+        },
+        {
+            "fieldname": "office_location",
+            "fieldtype": "Link",
+            "label": "Office Location",
+            "options": "Office Location"
+        },
+        {
+            "fieldname": "latitude",
+            "fieldtype": "Float",
+            "label": "Latitude",
+            "precision": "8"
+        },
+        {
+            "fieldname": "longitude",
+            "fieldtype": "Float",
+            "label": "Longitude",
+            "precision": "8"
+        }
+    ],
+    "istable": 1,
+    "links": [],
+    "modified": "2025-01-25 12:00:00.000000",
+    "modified_by": "Administrator",
+    "module": "Attendance Portal",
+    "name": "Attendance Punch History",
+    "owner": "Administrator",
+    "permissions": [],
+    "sort_field": "modified",
+    "sort_order": "DESC",
+    "states": []
+}

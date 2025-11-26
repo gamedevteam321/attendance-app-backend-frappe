@@ -1,0 +1,1558 @@
+"""
+API methods for Attendance Portal
+All methods are whitelisted for frontend access via frappe-react-sdk
+"""
+
+import frappe
+from frappe import _
+from frappe.utils import today, now_datetime, get_datetime
+from datetime import datetime
+import math
+
+
+@frappe.whitelist(allow_guest=True)
+def get_current_profile():
+    """
+    Get current user's profile with role information
+    
+    Returns:
+        dict: {
+            user: str,
+            employee_id: str,
+            employee_name: str,
+            roles: list,
+            is_manager: bool,
+            is_hr_admin: bool
+        }
+    """
+    user = frappe.session.user
+    print(f"DEBUG: get_current_profile called. User: {user}")
+    print(f"DEBUG: Headers: {frappe.request.headers}")
+    
+    # Get employee linked to this user
+    employee = frappe.db.get_value("Employee", {"user_id": user}, ["name", "employee_name"], as_dict=True)
+    print(f"DEBUG: Found employee: {employee}")
+    
+    if not employee:
+        # Return basic profile without employee details
+        roles = frappe.get_roles(user)
+        return {
+            "user": user,
+            "employee_id": None,
+            "employee_name": user, # Fallback to username
+            "roles": roles,
+            "is_manager": "Manager" in roles,
+            "is_hr_admin": "HR Admin" in roles,
+            "debug_message": f"No employee found for user '{user}' via query {{'user_id': '{user}'}}"
+        }
+    
+    # Get user roles
+    roles = frappe.get_roles(user)
+    
+    return {
+        "user": user,
+        "employee_id": employee.name,
+        "employee_name": employee.employee_name,
+        "roles": roles,
+        "is_manager": "Manager" in roles,
+        "is_hr_admin": "HR Admin" in roles
+    }
+
+
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """
+    Calculate the great circle distance between two points on earth (in meters)
+    
+    Args:
+        lat1, lon1: First point coordinates
+        lat2, lon2: Second point coordinates
+    
+    Returns:
+        float: Distance in meters
+    """
+    # Convert decimal degrees to radians
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    
+    # Haversine formula
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    
+    # Radius of earth in meters
+    r = 6371000
+    
+    return c * r
+
+
+@frappe.whitelist()
+def is_inside_office(employee, lat, lng):
+    """
+    Check if coordinates are within any allowed office location
+    
+    Args:
+        employee: Employee ID
+        lat: Latitude
+        lng: Longitude
+    
+    Returns:
+        dict: {
+            inside: bool,
+            office: str | None,
+            distance: float | None
+        }
+    """
+    lat = float(lat)
+    lng = float(lng)
+    
+    # Get allowed office locations for employee
+    employee_doc = frappe.get_doc("Employee", employee)
+    
+    if not employee_doc.allowed_locations:
+        return {
+            "inside": True,
+            "office": "Anywhere",
+            "distance": 0,
+            "message": "No office locations assigned - allowing from anywhere"
+        }
+    
+    # Check each allowed office location
+    for location_row in employee_doc.allowed_locations:
+        office = frappe.get_doc("Office Location", location_row.office)
+        
+        if not office.is_active:
+            continue
+        
+        # Calculate distance
+        distance = haversine_distance(lat, lng, office.latitude, office.longitude)
+        
+        # Check if within radius
+        if distance <= office.radius_meters:
+            return {
+                "inside": True,
+                "office": office.name,
+                "office_name": office.office_name,
+                "distance": round(distance, 2)
+            }
+    
+    return {
+        "inside": False,
+        "office": None,
+        "distance": None
+    }
+
+
+@frappe.whitelist()
+def has_remote_for_date(employee, date):
+    """
+    Check if employee has approved remote work for given date
+    
+    Args:
+        employee: Employee ID
+        date: Date string (YYYY-MM-DD)
+    
+    Returns:
+        dict: {
+            has_remote: bool,
+            request_name: str | None
+        }
+    """
+    # Find approved remote working requests that cover this date
+    requests = frappe.get_all(
+        "Remote Working Request",
+        filters={
+            "employee": employee,
+            "status": "Approved",
+            "from_date": ["<=", date],
+            "to_date": [">=", date]
+        },
+        fields=["name", "from_date", "to_date"]
+    )
+    
+    if requests:
+        return {
+            "has_remote": True,
+            "request_name": requests[0].name
+        }
+    
+    return {
+        "has_remote": False,
+        "request_name": None
+    }
+
+
+@frappe.whitelist()
+def mark_punch(employee, lat, lng, action):
+    """
+    Mark punch in or out
+    
+    Args:
+        employee: Employee ID
+        lat: Latitude
+        lng: Longitude
+        action: "IN" or "OUT"
+    
+    Returns:
+        dict: Attendance Log document
+    """
+    # Validate that employee belongs to current user
+    current_user = frappe.session.user
+    employee_user = frappe.db.get_value("Employee", employee, "user_id")
+    
+    if employee_user != current_user:
+        frappe.throw(_("You can only mark attendance for yourself"))
+    
+    lat = float(lat)
+    lng = float(lng)
+    attendance_date = today()
+    now_time = now_datetime()
+    
+    # Check if employee has remote work approved for today
+    remote_check = has_remote_for_date(employee, attendance_date)
+    
+    location_type = None
+    office_location = None
+    remote_req = None
+    
+    if remote_check["has_remote"]:
+        location_type = "Remote"
+        remote_req = remote_check["request_name"]
+    else:
+        # Check if inside office ONLY for IN action
+        # For OUT action, we allow from anywhere
+        if action == "IN":
+            office_check = is_inside_office(employee, lat, lng)
+            
+            if not office_check["inside"]:
+                frappe.throw(_("You are not within any allowed office location. Distance from nearest office may be too far. Please request remote work if working remotely."))
+            
+            location_type = "Office"
+            office_location = office_check["office"]
+        else:
+            # For OUT, we just record where they are, but don't validate strict office bounds
+            # However, we can still check if they happen to be in an office for the record
+            office_check = is_inside_office(employee, lat, lng)
+            if office_check["inside"]:
+                location_type = "Office"
+                office_location = office_check["office"]
+            else:
+                location_type = "Remote" # Or "Field" / "Unknown"
+
+    if action == "IN":
+        # Check if there's already an attendance log for today
+        attendance_log_name = frappe.db.get_value(
+            "Attendance Log",
+            {"employee": employee, "attendance_date": attendance_date}
+        )
+        
+        if attendance_log_name:
+            attendance_log = frappe.get_doc("Attendance Log", attendance_log_name)
+            
+            # If already punched in (check_out is None), throw error
+            if not attendance_log.check_out:
+                 frappe.throw(_("You have already punched in today. Please punch out first."), exc=frappe.exceptions.DuplicateEntryError)
+            
+            # Re-punching IN: Reset check_out and update check_in
+            attendance_log.check_out = None
+            attendance_log.check_out_lat = None
+            attendance_log.check_out_lng = None
+            attendance_log.check_in = now_time
+            attendance_log.check_in_lat = lat
+            attendance_log.check_in_lng = lng
+            attendance_log.location_type = location_type
+            attendance_log.office_location = office_location
+            attendance_log.status = "Present"
+            
+        else:
+            # Create new attendance log
+            attendance_log = frappe.get_doc({
+                "doctype": "Attendance Log",
+                "employee": employee,
+                "attendance_date": attendance_date,
+                "check_in": now_time,
+                "location_type": location_type,
+                "office_location": office_location,
+                "check_in_lat": lat,
+                "check_in_lng": lng,
+                "working_remote_req": remote_req,
+                "status": "Present"
+            })
+            
+    elif action == "OUT":
+        # Find today's attendance log with check_in but no check_out
+        attendance_log_name = frappe.db.get_value(
+            "Attendance Log",
+            {
+                "employee": employee,
+                "attendance_date": attendance_date,
+                "check_in": ["is", "set"],
+                "check_out": ["is", "not set"]
+            }
+        )
+        
+        if not attendance_log_name:
+            frappe.throw(_("No active punch-in found for today. Please punch in first."))
+        
+        # Update attendance log
+        attendance_log = frappe.get_doc("Attendance Log", attendance_log_name)
+        attendance_log.check_out = now_time
+        attendance_log.check_out_lat = lat
+        attendance_log.check_out_lng = lng
+        
+        # Calculate working hours (simple duration for now, but history tracking handles complex cases)
+        # Note: Total working hours calculation might need to sum up history intervals later
+        check_in_time = get_datetime(attendance_log.check_in)
+        check_out_time = get_datetime(attendance_log.check_out)
+        duration_hours = (check_out_time - check_in_time).total_seconds() / 3600
+        
+        if duration_hours < 4:
+            attendance_log.status = "Half Day"
+        else:
+            attendance_log.status = "Present"
+
+    else:
+        frappe.throw(_("Invalid action. Must be 'IN' or 'OUT'"))
+
+    # Add to Punch History
+    attendance_log.append("punch_history", {
+        "punch_type": action,
+        "punch_time": now_time,
+        "latitude": lat,
+        "longitude": lng,
+        "location_type": location_type,
+        "office_location": office_location
+    })
+    
+    # Calculate total working hours from history
+    total_hours = 0
+    last_in_time = None
+    
+    # Sort history by time to be safe
+    sorted_history = sorted(attendance_log.punch_history, key=lambda x: get_datetime(x.punch_time))
+    
+    for punch in sorted_history:
+        if punch.punch_type == "IN":
+            last_in_time = get_datetime(punch.punch_time)
+        elif punch.punch_type == "OUT" and last_in_time:
+            out_time = get_datetime(punch.punch_time)
+            duration = (out_time - last_in_time).total_seconds() / 3600
+            total_hours += duration
+            last_in_time = None
+            
+    attendance_log.working_hours = round(total_hours, 2)
+    
+    # Update status based on total hours
+    if attendance_log.working_hours < 4:
+        attendance_log.status = "Half Day"
+    else:
+        attendance_log.status = "Present"
+    
+    attendance_log.save(ignore_permissions=True)
+    frappe.db.commit()
+    
+    return attendance_log.as_dict()
+
+
+@frappe.whitelist()
+def create_remote_request(employee, from_date, to_date, reason, lat=None, lng=None):
+    """
+    Create remote working request
+    
+    Args:
+        employee: Employee ID
+        from_date: Start date
+        to_date: End date
+        reason: Reason for remote work
+        lat: Latitude (optional)
+        lng: Longitude (optional)
+    
+    Returns:
+        dict: Remote Working Request document
+    """
+    # Validate that employee belongs to current user
+    current_user = frappe.session.user
+    employee_user = frappe.db.get_value("Employee", employee, "user_id")
+    
+    if employee_user != current_user:
+        frappe.throw(_("You can only create requests for yourself"))
+    
+    # Get employee's manager as approver
+    manager = frappe.db.get_value("Employee", employee, "reports_to")
+    
+    # Create remote working request
+    remote_request = frappe.get_doc({
+        "doctype": "Remote Working Request",
+        "employee": employee,
+        "from_date": from_date,
+        "to_date": to_date,
+        "reason": reason,
+        "request_lat": float(lat) if lat else None,
+        "request_lng": float(lng) if lng else None,
+        "approver": manager,
+        "status": "Pending"
+    })
+    remote_request.insert(ignore_permissions=True)
+    frappe.db.commit()
+    
+    return remote_request.as_dict()
+
+
+@frappe.whitelist()
+def apply_for_leave(employee, leave_type, from_date, to_date, reason):
+    """
+    Create leave application with validation based on leave type.
+    
+    Rules:
+    - Casual Leave: Cannot apply if balance <= 0
+    - Sick Leave: Can apply even if balance <= 0 (can go negative)
+    - Compensatory Leave: No balance check (no deduction)
+    
+    Args:
+        employee: Employee ID
+        leave_type: Leave Type
+        from_date: Start date
+        to_date: End date
+        reason: Reason for leave
+    
+    Returns:
+        dict: Leave Application document
+    """
+    # Validate that employee belongs to current user (unless HR Admin or System user)
+    current_user = frappe.session.user
+    employee_user = frappe.db.get_value("Employee", employee, "user_id")
+    
+    # Allow if: user is the employee, or user is HR Admin/System Manager, or employee has no user_id
+    is_hr_admin = "HR Admin" in frappe.get_roles(current_user) or "System Manager" in frappe.get_roles(current_user)
+    
+    if employee_user and employee_user != current_user and not is_hr_admin:
+        frappe.throw(_("You can only apply for leave for yourself"))
+    
+    # Validate leave balance for Casual Leave
+    if leave_type == "Casual Leave":
+        balances = get_leave_balances(employee)
+        casual_balance = next((b for b in balances if b["leave_type"] == "Casual Leave"), None)
+        
+        if casual_balance and casual_balance["remaining"] <= 0:
+            frappe.throw(_("Insufficient Casual Leave balance. You have {0} leaves remaining.").format(casual_balance['remaining']))
+    
+    # Create leave application
+    leave_application = frappe.get_doc({
+        "doctype": "Leave Application",
+        "employee": employee,
+        "leave_type": leave_type,
+        "from_date": from_date,
+        "to_date": to_date,
+        "description": reason,
+        "status": "Open",
+        "docstatus": 0,
+        "posting_date": today()
+    })
+    
+    leave_application.insert(ignore_permissions=True)
+    frappe.db.commit()
+    
+    return leave_application.as_dict()
+
+
+@frappe.whitelist()
+def get_leave_balances(employee):
+    """
+    Get leave balances for employee - shows 3 separate leave types.
+    
+    Args:
+        employee: Employee ID
+    
+    Returns:
+        list: [{
+            leave_type: str,
+            allocated: float,
+            used: float,
+            remaining: float
+        }]
+    """
+    from datetime import datetime
+    
+    # Get current year
+    current_year = datetime.now().year
+    year_start = f"{current_year}-01-01"
+    year_end = f"{current_year}-12-31"
+    
+    leave_types = ["Casual Leave", "Sick Leave", "Compensatory Leave"]
+    balances = []
+    
+    for leave_type in leave_types:
+        # Get total allocated leaves for this type
+        # Use COALESCE to get whichever field has a value (not both)
+        allocated = frappe.db.sql("""
+            SELECT COALESCE(SUM(COALESCE(total_leaves_allocated, new_leaves_allocated, 0)), 0)
+            FROM `tabLeave Allocation`
+            WHERE employee = %s
+            AND leave_type = %s
+            AND from_date <= %s
+            AND to_date >= %s
+            AND docstatus = 1
+        """, (employee, leave_type, year_end, year_start))[0][0] or 0
+        
+        # Get used leaves (approved applications)
+        # For Compensatory Leave, we don't deduct, so used = 0
+        if leave_type == "Compensatory Leave":
+            used = 0
+        else:
+            used = frappe.db.sql("""
+                SELECT COALESCE(SUM(total_leave_days), 0)
+                FROM `tabLeave Application`
+                WHERE employee = %s
+                AND leave_type = %s
+                AND status = 'Approved'
+                AND from_date >= %s
+                AND to_date <= %s
+                AND docstatus = 1
+            """, (employee, leave_type, year_start, year_end))[0][0] or 0
+        
+        balances.append({
+            "leave_type": leave_type,
+            "allocated": float(allocated),
+            "used": float(used),
+            "remaining": float(allocated) - float(used)
+        })
+    
+    return balances
+
+
+@frappe.whitelist()
+def approve_request(doctype, name, status):
+    """
+    Approve or reject a request (Remote Working Request, Attendance Regularization Request, Leave Application)
+    
+    Args:
+        doctype: DocType name
+        name: Document name
+        status: "Approved" or "Rejected"
+    
+    Returns:
+        dict: Updated document
+    """
+    if doctype not in ["Remote Working Request", "Attendance Regularization Request", "Leave Application"]:
+        frappe.throw(_("Invalid doctype"))
+    
+    if status not in ["Approved", "Rejected"]:
+        frappe.throw(_("Invalid status"))
+    
+    # Get document
+    doc = frappe.get_doc(doctype, name)
+    
+    # Check if current user is the approver
+    current_user = frappe.session.user
+    
+    # Determine approver field name based on DocType
+    approver_field = "approver"
+    if doctype == "Leave Application":
+        approver_field = "leave_approver"
+        
+    # Get approver ID from the document
+    approver_id = getattr(doc, approver_field, None)
+    
+    # Get approver's user ID
+    approver_user = None
+    if approver_id:
+        approver_user = frappe.db.get_value("Employee", approver_id, "user_id")
+    
+    # Allow HR Admin or Manager to approve any request
+    roles = frappe.get_roles(current_user)
+    is_authorized = "HR Admin" in roles or "Manager" in roles
+    
+    if not is_authorized and approver_user != current_user:
+        frappe.throw(_("You are not authorized to approve this request"))
+    
+    # Update status
+    doc.status = status
+    doc.save(ignore_permissions=True)
+    
+    # If approved and submittable, submit the document
+    if status == "Approved" and doc.meta.is_submittable:
+        doc.submit()
+    
+    # If it's an attendance regularization request and approved, update attendance log
+    if doctype == "Attendance Regularization Request" and status == "Approved":
+        update_attendance_from_regularization(doc)
+    
+    frappe.db.commit()
+    
+    return doc.as_dict()
+
+
+def update_attendance_from_regularization(regularization_doc):
+    """
+    Update or create attendance log from approved regularization request
+    
+    Args:
+        regularization_doc: Attendance Regularization Request document
+    """
+    # Check if attendance log exists for that date
+    attendance_log_name = frappe.db.get_value(
+        "Attendance Log",
+        {
+            "employee": regularization_doc.employee,
+            "attendance_date": regularization_doc.attendance_date
+        }
+    )
+    
+    if attendance_log_name:
+        # Update existing log
+        attendance_log = frappe.get_doc("Attendance Log", attendance_log_name)
+        if regularization_doc.requested_in:
+            attendance_log.check_in = regularization_doc.requested_in
+        if regularization_doc.requested_out:
+            attendance_log.check_out = regularization_doc.requested_out
+        attendance_log.save(ignore_permissions=True)
+    else:
+        # Create new log
+        attendance_log = frappe.get_doc({
+            "doctype": "Attendance Log",
+            "employee": regularization_doc.employee,
+            "attendance_date": regularization_doc.attendance_date,
+            "check_in": regularization_doc.requested_in,
+            "check_out": regularization_doc.requested_out,
+            "status": "Present"
+        })
+        attendance_log.insert(ignore_permissions=True)
+
+
+@frappe.whitelist()
+def get_attendance_logs(employee, date=None):
+    """
+    Get attendance logs for employee
+    
+    Args:
+        employee: Employee ID
+        date: Optional date filter
+    """
+    # Validate that employee belongs to current user
+    current_user = frappe.session.user
+    employee_user = frappe.db.get_value("Employee", employee, "user_id")
+    
+    if employee_user != current_user:
+        frappe.throw(_("You can only view your own attendance logs"))
+    
+    filters = {"employee": employee}
+    if date:
+        filters["attendance_date"] = date
+        
+    logs = frappe.get_all(
+        "Attendance Log",
+        filters=filters,
+        fields=["name", "check_in", "check_out", "location_type", "status", "attendance_date", "working_hours"],
+        order_by="attendance_date desc"
+    )
+    
+    # Fetch punch history for each log
+    for log in logs:
+        log["punch_history"] = frappe.get_all(
+            "Attendance Punch History",
+            filters={"parent": log.name},
+            fields=["punch_type", "punch_time", "location_type", "office_location", "latitude", "longitude"],
+            order_by="punch_time asc"
+        )
+        
+        # Ensure working_hours is set (for old logs or if calculation failed)
+    for log in logs:
+        if not log.working_hours:
+            if log.check_in and log.check_out:
+                check_in = get_datetime(log.check_in)
+                check_out = get_datetime(log.check_out)
+                duration = (check_out - check_in).total_seconds() / 3600
+                log["working_hours"] = round(duration, 2)
+            else:
+                log["working_hours"] = 0
+            
+    return logs
+
+
+@frappe.whitelist()
+def get_office_locations():
+    """
+    Get all office locations
+    """
+    # Allow HR Admin, HR Manager, System Manager, and Employee to view
+    # For now, we'll just return all active locations for employees, 
+    # and all locations for Admins.
+    
+    filters = {}
+    
+    # If not admin, only show active
+    roles = frappe.get_roles(frappe.session.user)
+    if "HR Admin" not in roles and "System Manager" not in roles and "HR Manager" not in roles:
+        filters["is_active"] = 1
+        
+    locations = frappe.get_all(
+        "Office Location",
+        filters=filters,
+        fields=["name", "office_name", "company", "latitude", "longitude", "radius_meters", "is_active", "address"],
+        order_by="creation desc"
+    )
+    
+    
+    return locations
+
+
+@frappe.whitelist()
+def manage_office_location(data):
+    """
+    Create or update office location
+    """
+    if isinstance(data, str):
+        data = frappe.parse_json(data)
+        
+    if not frappe.db.exists("Company", data.get("company")):
+        # If company doesn't exist, default to first company or create dummy
+        # For this app context, we'll just ensure a company exists or use the first one
+        companies = frappe.get_all("Company")
+        if companies:
+            data["company"] = companies[0].name
+        else:
+            # Create a default company if none exists
+            c = frappe.get_doc({"doctype": "Company", "company_name": "Nexchar", "default_currency": "INR"})
+            c.insert(ignore_permissions=True)
+            data["company"] = "Nexchar"
+
+    if data.get("name"):
+        # Update
+        doc = frappe.get_doc("Office Location", data.get("name"))
+        doc.update(data)
+        doc.save(ignore_permissions=True)
+        return doc
+    else:
+        # Create
+        doc = frappe.get_doc({
+            "doctype": "Office Location",
+            **data
+        })
+        doc.insert(ignore_permissions=True)
+        return doc
+
+
+@frappe.whitelist()
+def get_pending_requests():
+    """
+    Get pending requests for current user (Manager/HR)
+    
+    Returns:
+        dict: {
+            leave_applications: list,
+            remote_requests: list,
+            regularization_requests: list
+        }
+    """
+    current_user = frappe.session.user
+    
+    # Get employee linked to this user
+    employee = frappe.db.get_value("Employee", {"user_id": current_user}, "name")
+    
+    if not employee:
+        # If not an employee, check if HR Admin
+        roles = frappe.get_roles(current_user)
+        if "HR Admin" not in roles:
+             return {
+                "leave_applications": [],
+                "remote_requests": [],
+                "regularization_requests": []
+            }
+        # HR Admin sees all pending
+        filters = {"status": "Open"}
+        remote_filters = {"status": "Pending"}
+    else:
+        # Manager sees requests where they are the approver
+        # For Leave Application, approver is usually determined by workflow or 'reports_to'
+        # For simplicity, we'll fetch requests from employees who report to this employee
+        
+        # Get direct reports
+        direct_reports = frappe.get_all("Employee", filters={"reports_to": employee}, pluck="name")
+        
+        if not direct_reports:
+             return {
+                "leave_applications": [],
+                "remote_requests": [],
+                "regularization_requests": []
+            }
+            
+        filters = {"employee": ["in", direct_reports], "status": "Open"}
+        remote_filters = {"approver": employee, "status": "Pending"}
+
+    # Fetch Leave Applications
+    leave_applications = frappe.get_all(
+        "Leave Application",
+        filters=filters,
+        fields=["name", "employee", "employee_name", "leave_type", "from_date", "to_date", "total_leave_days", "description", "status", "posting_date"],
+        order_by="posting_date desc"
+    )
+    
+    # Fetch Remote Working Requests
+    remote_requests = frappe.get_all(
+        "Remote Working Request",
+        filters=remote_filters,
+        fields=["name", "employee", "from_date", "to_date", "reason", "status", "creation"],
+        order_by="creation desc"
+    )
+    
+    # Manually fetch employee names for remote requests
+    for req in remote_requests:
+        req["employee_name"] = frappe.db.get_value("Employee", req.employee, "employee_name")
+    
+    # Fetch Regularization Requests (assuming similar structure/logic)
+    regularization_requests = []
+    if frappe.db.exists("DocType", "Attendance Regularization Request"):
+         regularization_requests = frappe.get_all(
+            "Attendance Regularization Request",
+            filters=remote_filters, # Assuming similar approver field
+            fields=["name", "employee", "attendance_date", "reason", "status", "creation"],
+            order_by="creation desc"
+        )
+         for req in regularization_requests:
+            req["employee_name"] = frappe.db.get_value("Employee", req.employee, "employee_name")
+    
+    return {
+        "leave_applications": leave_applications,
+        "remote_requests": remote_requests,
+        "regularization_requests": regularization_requests
+    }
+
+
+@frappe.whitelist(allow_guest=True)
+def get_api_keys(usr, pwd):
+    """
+    Authenticate user and return API keys.
+    Generates keys if they don't exist.
+    Supports login with both username and email.
+    """
+    # Check if usr is an email or username
+    # If it doesn't contain @, treat it as a username and look up the email
+    if '@' not in usr:
+        # It's a username, find the corresponding email
+        user_email = frappe.db.get_value("User", {"username": usr}, "name")
+        if not user_email:
+            frappe.throw(_("Invalid username or password"))
+        usr = user_email
+    
+    try:
+        login_manager = frappe.auth.LoginManager()
+        login_manager.authenticate(user=usr, pwd=pwd)
+    except Exception:
+        frappe.throw(_("Invalid username or password"))
+        
+    user = frappe.get_doc("User", usr)
+    
+    # Generate API Key if missing
+    if not user.api_key:
+        api_key = frappe.generate_hash(length=15)
+        user.api_key = api_key
+        user.save(ignore_permissions=True)
+    
+    # Generate API Secret (we can't retrieve existing one, so we must generate new one if requested)
+    # NOTE: This invalidates old secrets!
+    api_secret = frappe.generate_hash(length=15)
+    user.api_secret = api_secret
+    user.save(ignore_permissions=True)
+    frappe.db.commit()
+    
+    return {
+        "api_key": user.api_key,
+        "api_secret": api_secret
+    }
+
+
+@frappe.whitelist()
+def get_employee_requests(doctype):
+    """
+    Get requests for the current employee
+    """
+    user = frappe.session.user
+    employee = frappe.db.get_value("Employee", {"user_id": user}, "name")
+    
+    if not employee:
+        return []
+        
+    if doctype not in ["Remote Working Request", "Leave Application", "Attendance Regularization Request"]:
+        frappe.throw(_("Invalid doctype"))
+        
+    return frappe.get_all(
+        doctype,
+        filters={"employee": employee},
+        fields=["*"],
+        order_by="creation desc"
+    )
+
+
+@frappe.whitelist()
+def create_employee(first_name, last_name, email, password, designation, gender, date_of_birth, date_of_joining, company, reports_to, office):
+    """
+    Create a new User and Employee document.
+    """
+    # Check permissions
+    if "HR Admin" not in frappe.get_roles(frappe.session.user):
+        frappe.throw(_("Not authorized"))
+
+    # 1. Create User
+    if frappe.db.exists("User", email):
+        frappe.throw(_("User with this email already exists"))
+        
+    user = frappe.get_doc({
+        "doctype": "User",
+        "email": email,
+        "first_name": first_name,
+        "last_name": last_name,
+        "send_welcome_email": 0,
+        "enabled": 1,
+        "roles": [{"role": "Employee"}]
+    })
+    user.new_password = password
+    user.insert(ignore_permissions=True)
+    
+    # 2. Create Employee
+    employee = frappe.get_doc({
+        "doctype": "Employee",
+        "first_name": first_name,
+        "last_name": last_name,
+        "user_id": email,
+        "designation": designation,
+        "gender": gender,
+        "date_of_birth": date_of_birth,
+        "date_of_joining": date_of_joining,
+        "company": company,
+        "reports_to": reports_to,
+        "status": "Active",
+        "allowed_locations": [{"office": office}]
+    })
+    employee.insert(ignore_permissions=True)
+    
+    frappe.db.commit()
+    
+    return employee.as_dict()
+
+
+@frappe.whitelist()
+def update_employee(employee_id, first_name, last_name, email, designation, reports_to, status, office, password=None):
+    """
+    Update Employee and User details.
+    """
+    # Check permissions
+    if "HR Admin" not in frappe.get_roles(frappe.session.user):
+        frappe.throw(_("Not authorized"))
+
+    # 1. Update Employee
+    employee = frappe.get_doc("Employee", employee_id)
+    employee.first_name = first_name
+    employee.last_name = last_name
+    employee.designation = designation
+    employee.reports_to = reports_to
+    employee.status = status
+    
+    # Update Office (Replace existing allowed locations for simplicity based on current flow)
+    employee.allowed_locations = []
+    if office:
+        employee.append("allowed_locations", {"office": office})
+        
+    employee.save(ignore_permissions=True)
+    
+    # 2. Update User
+    if employee.user_id:
+        user = frappe.get_doc("User", employee.user_id)
+        user.first_name = first_name
+        user.last_name = last_name
+        user.email = email
+        
+        if password:
+            user.new_password = password
+            
+        user.save(ignore_permissions=True)
+        
+        # If email changed, update user_id in Employee
+        if email != employee.user_id:
+            frappe.rename_doc("User", employee.user_id, email, ignore_permissions=True)
+            employee.user_id = email
+            employee.save(ignore_permissions=True)
+
+    frappe.db.commit()
+    return employee.as_dict()
+
+
+@frappe.whitelist()
+def get_employee_stats(employee, from_date, to_date):
+    """
+    Get attendance statistics for an employee within a date range.
+    """
+    # Check permissions (HR Admin or self)
+    current_user = frappe.session.user
+    roles = frappe.get_roles(current_user)
+    
+    if "HR Admin" not in roles:
+        # Check if requesting for self
+        linked_employee = frappe.db.get_value("Employee", {"user_id": current_user}, "name")
+        if linked_employee != employee:
+            frappe.throw(_("Not authorized"))
+
+    logs = frappe.get_all(
+        "Attendance Log",
+        filters={
+            "employee": employee,
+            "attendance_date": ["between", [from_date, to_date]]
+        },
+        fields=["attendance_date", "check_in", "check_out", "status", "working_hours"],
+        order_by="attendance_date desc"
+    )
+    
+    total_present = 0
+    total_absent = 0
+    total_late = 0
+    total_hours = 0.0
+    
+    # Calculate stats
+    for log in logs:
+        if log.status == "Present":
+            total_present += 1
+            if log.working_hours:
+                total_hours += log.working_hours
+                
+            # Check for late entry (assuming 9:30 AM is late)
+            if log.check_in:
+                check_in_time = get_datetime(log.check_in).time()
+                # Hardcoded late threshold for now, can be made configurable
+                if check_in_time.hour > 9 or (check_in_time.hour == 9 and check_in_time.minute > 30):
+                    total_late += 1
+        elif log.status == "Absent":
+            total_absent += 1
+            
+    avg_hours = total_hours / total_present if total_present > 0 else 0
+    
+    return {
+        "total_present": total_present,
+        "total_absent": total_absent,
+        "total_late": total_late,
+        "total_hours": round(total_hours, 2),
+        "avg_hours": round(avg_hours, 2),
+        "logs": logs
+    }
+
+
+@frappe.whitelist()
+def get_notifications(limit=20):
+    """
+    Get notifications for current user about leave and remote work requests.
+    
+    For managers: pending requests that need approval
+    For employees: status updates on their requests
+    """
+    current_user = frappe.session.user
+    employee = frappe.db.get_value("Employee", {"user_id": current_user}, "name")
+    
+    if not employee:
+        return []
+    
+    notifications = []
+    
+    # Check if user is a manager
+    roles = frappe.get_roles(current_user)
+    is_manager = "Manager" in roles or "HR Admin" in roles
+    
+    # For managers: get pending requests from their reportees
+    if is_manager:
+        # Pending leave requests - wrapped in try-except in case field names differ
+        try:
+            leave_requests = frappe.get_all(
+                "Leave Application",
+                filters={
+                    "leave_approver": employee,
+                    "status": "Open"
+                },
+                fields=["name", "employee", "employee_name", "from_date", "to_date", "leave_type", "creation"],
+                order_by="creation desc",
+                limit=limit
+            )
+            
+            for leave in leave_requests:
+                notifications.append({
+                    "id": f"leave-{leave.name}",
+                    "type": "leave_pending",
+                    "title": "Leave Request Pending",
+                    "message": f"{leave.employee_name} requested {leave.leave_type} from {leave.from_date} to {leave.to_date}",
+                    "timestamp": leave.creation,
+                    "link": "/approvals",
+                    "unread": True
+                })
+        except Exception as e:
+            # Leave Application schema might be different, skip
+            print(f"Error fetching leave requests for manager: {e}")
+            pass
+        
+        # Pending remote work requests (only if DocType exists)
+        try:
+            remote_requests = frappe.get_all(
+                "Remote Work Request",
+                filters={
+                    "approver": employee,
+                    "status": "Pending"
+                },
+                fields=["name", "employee", "employee_name", "from_date", "to_date", "creation"],
+                order_by="creation desc",
+                limit=limit
+            )
+            
+            for remote in remote_requests:
+                notifications.append({
+                    "id": f"remote-{remote.name}",
+                    "type": "remote_pending",
+                    "title": "Remote Work Request Pending",
+                    "message": f"{remote.employee_name} requested remote work from {remote.from_date} to {remote.to_date}",
+                    "timestamp": remote.creation,
+                    "link": "/approvals",
+                    "unread": True
+                })
+        except Exception:
+            # Remote Work Request DocType doesn't exist, skip
+            pass
+    
+    # For employees: get status updates on their own requests
+    # Leave requests (approved/rejected in last 7 days)
+    try:
+        employee_leaves = frappe.get_all(
+            "Leave Application",
+            filters={
+                "employee": employee,
+                "status": ["in", ["Approved", "Rejected"]],
+                "modified": [">=", frappe.utils.add_days(today(), -7)]
+            },
+            fields=["name", "status", "from_date", "to_date", "leave_type", "modified"],
+            order_by="modified desc",
+            limit=limit
+        )
+        
+        for leave in employee_leaves:
+            status_text = "approved" if leave.status == "Approved" else "rejected"
+            notifications.append({
+                "id": f"leave-status-{leave.name}",
+                "type": f"leave_{status_text}",
+                "title": f"Leave Request {leave.status}",
+                "message": f"Your {leave.leave_type} from {leave.from_date} to {leave.to_date} was {status_text}",
+                "timestamp": leave.modified,
+                "link": "/leaves",
+                "unread": True
+            })
+    except Exception as e:
+        # Leave Application schema might be different, skip
+        print(f"Error fetching employee leave status: {e}")
+        pass
+    
+    # Remote work requests (approved/rejected in last 7 days) - only if DocType exists
+    try:
+        employee_remote = frappe.get_all(
+            "Remote Work Request",
+            filters={
+                "employee": employee,
+                "status": ["in", ["Approved", "Rejected"]],
+                "modified": [">=", frappe.utils.add_days(today(), -7)]
+            },
+            fields=["name", "status", "from_date", "to_date", "modified"],
+            order_by="modified desc",
+            limit=limit
+        )
+        
+        for remote in employee_remote:
+            status_text = "approved" if remote.status == "Approved" else "rejected"
+            notifications.append({
+                "id": f"remote-status-{remote.name}",
+                "type": f"remote_{status_text}",
+                "title": f"Remote Work Request {remote.status}",
+                "message": f"Your remote work request from {remote.from_date} to {remote.to_date} was {status_text}",
+                "timestamp": remote.modified,
+                "link": "/",
+                "unread": True
+            })
+    except Exception:
+        # Remote Work Request DocType doesn't exist, skip
+        pass
+    
+    # Sort by timestamp descending
+    notifications.sort(key=lambda x: x["timestamp"], reverse=True)
+    
+    return notifications[:limit]
+
+
+@frappe.whitelist()
+def get_employee_leave_allocations(employee_id):
+    """
+    Get all leave allocations for an employee.
+    
+    Args:
+        employee_id: Employee ID
+    
+    Returns:
+        list: Leave allocations with details
+    """
+    allocations = frappe.get_all(
+        "Leave Allocation",
+        filters={"employee": employee_id},
+        fields=[
+            "name", "leave_type", "from_date", "to_date", 
+            "total_leaves_allocated", "new_leaves_allocated", 
+            "docstatus", "creation"
+        ],
+        order_by="creation desc"
+    )
+    
+    result = []
+    for alloc in allocations:
+        # Get used leaves for this allocation period
+        used = frappe.db.sql("""
+            SELECT COALESCE(SUM(total_leave_days), 0)
+            FROM `tabLeave Application`
+            WHERE employee = %s
+            AND leave_type = %s
+            AND status = 'Approved'
+            AND from_date >= %s
+            AND to_date <= %s
+            AND docstatus = 1
+        """, (employee_id, alloc.leave_type, alloc.from_date, alloc.to_date))[0][0] or 0
+        
+        result.append({
+            "name": alloc.name,
+            "leave_type": alloc.leave_type,
+            "from_date": alloc.from_date,
+            "to_date": alloc.to_date,
+            "total_allocated": alloc.total_leaves_allocated or alloc.new_leaves_allocated or 0,
+            "used": float(used),
+            "remaining": (alloc.total_leaves_allocated or alloc.new_leaves_allocated or 0) - float(used),
+            "status": "Active" if alloc.docstatus == 1 else "Draft"
+        })
+    
+    return result
+
+
+@frappe.whitelist()
+def allocate_leave(employee_id, leave_type, from_date, to_date, total_leaves):
+    """
+    Create a new leave allocation for an employee.
+    Only HR Admins can allocate leaves.
+    """
+    # Check permissions
+    if "HR Admin" not in frappe.get_roles(frappe.session.user):
+        frappe.throw(_("Not authorized to allocate leaves"))
+    
+    # Create Leave Allocation
+    allocation = frappe.get_doc({
+        "doctype": "Leave Allocation",
+        "employee": employee_id,
+        "leave_type": leave_type,
+        "from_date": from_date,
+        "to_date": to_date,
+        "new_leaves_allocated": float(total_leaves),
+        "description": f"Allocated by {frappe.session.user}"
+    })
+    
+    allocation.insert(ignore_permissions=True)
+    allocation.submit()
+    frappe.db.commit()
+    
+    return {
+        "success": True,
+        "message": "Leave allocation created successfully",
+        "allocation_id": allocation.name
+    }
+
+
+@frappe.whitelist()
+def update_leave_allocation(allocation_id, total_leaves):
+    """
+    Update an existing leave allocation.
+    Only HR Admins can update allocations.
+    """
+    # Check permissions
+    if "HR Admin" not in frappe.get_roles(frappe.session.user):
+        frappe.throw(_("Not authorized to update leave allocations"))
+    
+    # Get existing allocation
+    allocation = frappe.get_doc("Leave Allocation", allocation_id)
+    
+    # Cancel the old allocation
+    allocation.cancel()
+    
+    # Create new allocation with updated leaves
+    new_allocation = frappe.get_doc({
+        "doctype": "Leave Allocation",
+        "employee": allocation.employee,
+        "leave_type": allocation.leave_type,
+        "from_date": allocation.from_date,
+        "to_date": allocation.to_date,
+        "new_leaves_allocated": float(total_leaves),
+        "description": f"Updated by {frappe.session.user} (Original: {allocation.name})"
+    })
+    
+    new_allocation.insert(ignore_permissions=True)
+    new_allocation.submit()
+    frappe.db.commit()
+    
+    return {
+        "success": True,
+        "message": "Leave allocation updated successfully",
+        "allocation_id": new_allocation.name
+    }
+
+
+@frappe.whitelist()
+def setup_default_leave_types():
+    """
+    Create default leave types if they don't exist.
+    Only HR Admins can set up leave types.
+    
+    3 Leave Types:
+    1. Casual Leave - 1/month, cannot go negative
+    2. Sick Leave - 1/month, can go negative
+    3. Compensatory Leave - request-based, no deduction
+    """
+    # Check permissions
+    if "HR Admin" not in frappe.get_roles(frappe.session.user):
+        frappe.throw(_("Not authorized to set up leave types"))
+    
+    default_leave_types = [
+        {
+            "name": "Casual Leave",
+            "max_leaves_allowed": 0,
+            "is_carry_forward": 1,
+            "allow_negative": 0,  # Cannot go negative
+            "include_holiday": 0,
+            "is_lwp": 0
+        },
+        {
+            "name": "Sick Leave",
+            "max_leaves_allowed": 0,
+            "is_carry_forward": 1,
+            "allow_negative": 1,  # Can go negative
+            "include_holiday": 0,
+            "is_lwp": 0
+        },
+        {
+            "name": "Compensatory Leave",
+            "max_leaves_allowed": 0,
+            "is_carry_forward": 0,
+            "allow_negative": 0,
+            "include_holiday": 0,
+            "is_lwp": 0  # Not LWP, but special handling (no deduction)
+        }
+    ]
+    
+    created = []
+    
+    for leave_type_data in default_leave_types:
+        # Check if leave type already exists
+        if not frappe.db.exists("Leave Type", leave_type_data["name"]):
+            leave_type = frappe.get_doc({
+                "doctype": "Leave Type",
+                **leave_type_data
+            })
+            leave_type.insert(ignore_permissions=True)
+            created.append(leave_type_data["name"])
+    
+    frappe.db.commit()
+    
+    return {
+        "success": True,
+        "message": f"Created {len(created)} leave types" if created else "All leave types already exist",
+        "created": created
+    }
+
+
+@frappe.whitelist()
+def allocate_monthly_leaves():
+    """
+    Allocate 1 Casual Leave and 1 Sick Leave to all active employees for the current month.
+    Should be run on the 1st of every month.
+    """
+    from datetime import datetime
+    import calendar
+    
+    # Get current month dates
+    now = datetime.now()
+    year = now.year
+    month = now.month
+    
+    # First and last day of current month
+    _, last_day = calendar.monthrange(year, month)
+    from_date = f"{year}-{month:02d}-01"
+    to_date = f"{year}-{month:02d}-{last_day}"
+    
+    # Get all active employees
+    employees = frappe.get_all("Employee", filters={"status": "Active"}, fields=["name", "employee_name"])
+    
+    allocations_created = 0
+    
+    for emp in employees:
+        # 1. Allocate Casual Leave
+        if not frappe.db.exists("Leave Allocation", {
+            "employee": emp.name,
+            "leave_type": "Casual Leave",
+            "from_date": from_date,
+            "to_date": to_date
+        }):
+            doc = frappe.get_doc({
+                "doctype": "Leave Allocation",
+                "employee": emp.name,
+                "employee_name": emp.employee_name,
+                "leave_type": "Casual Leave",
+                "from_date": from_date,
+                "to_date": to_date,
+                "new_leaves_allocated": 1,
+                "total_leaves_allocated": 0, # Explicitly 0 to avoid double counting
+                "docstatus": 1 # Submit immediately
+            })
+            doc.insert(ignore_permissions=True)
+            allocations_created += 1
+            
+        # 2. Allocate Sick Leave
+        if not frappe.db.exists("Leave Allocation", {
+            "employee": emp.name,
+            "leave_type": "Sick Leave",
+            "from_date": from_date,
+            "to_date": to_date
+        }):
+            doc = frappe.get_doc({
+                "doctype": "Leave Allocation",
+                "employee": emp.name,
+                "employee_name": emp.employee_name,
+                "leave_type": "Sick Leave",
+                "from_date": from_date,
+                "to_date": to_date,
+                "new_leaves_allocated": 1,
+                "total_leaves_allocated": 0, # Explicitly 0 to avoid double counting
+                "docstatus": 1 # Submit immediately
+            })
+            doc.insert(ignore_permissions=True)
+            allocations_created += 1
+            
+    frappe.db.commit()
+    return {"message": f"Allocated leaves for {len(employees)} employees. Total allocations: {allocations_created}"}
+
+@frappe.whitelist()
+def get_attendance_logs(employee=None, month=None, year=None):
+    """
+    Get attendance logs for a specific month/year
+    """
+    from datetime import datetime
+    
+    current_user = frappe.session.user
+    print(f"DEBUG: get_attendance_logs called with employee={employee}, user={current_user}")
+    
+    # If employee is not provided, get employee for current user
+    if not employee:
+        employee = frappe.db.get_value("Employee", {"user_id": current_user}, "name")
+        if not employee:
+            frappe.throw(_("No employee found for the current user"))
+    
+    # Validate that employee belongs to current user
+    employee_user = frappe.db.get_value("Employee", employee, "user_id")
+    
+    if employee_user != current_user:
+        frappe.throw(_("You can only view your own attendance logs"))
+    
+    if not month or not year:
+        now = datetime.now()
+        month = now.month
+        year = now.year
+        
+    start_date = f"{year}-{int(month):02d}-01"
+    # Calculate end date
+    import calendar
+    _, last_day = calendar.monthrange(int(year), int(month))
+    end_date = f"{year}-{int(month):02d}-{last_day}"
+    
+    logs = frappe.get_all("Attendance Log",
+        filters={
+            "employee": employee,
+            "attendance_date": ["between", [start_date, end_date]]
+        },
+        fields=["name", "attendance_date", "check_in", "check_out", "status", "working_hours"],
+        order_by="attendance_date asc"
+    )
+    
+    return logs
+
+@frappe.whitelist()
+@frappe.whitelist()
+def apply_for_regularization(employee=None, attendance_date=None, check_in=None, check_out=None, reason=None):
+    """
+    Create an Attendance Regularization Request
+    """
+    current_user = frappe.session.user
+    
+    # If employee is not provided (or passed as null/None from frontend), get employee for current user
+    if not employee:
+        employee = frappe.db.get_value("Employee", {"user_id": current_user}, "name")
+        if not employee:
+            frappe.throw(_("No employee found for the current user"))
+
+    # Validate that employee belongs to current user
+    employee_user = frappe.db.get_value("Employee", employee, "user_id")
+    
+    # Allow if: user is the employee, or user is HR Admin/System Manager/Manager
+    roles = frappe.get_roles(current_user)
+    is_authorized = "HR Admin" in roles or "System Manager" in roles or "Manager" in roles
+    
+    if employee_user and employee_user != current_user and not is_authorized:
+        frappe.throw(_("You can only apply for regularization for yourself"))
+        
+    # Check if request already exists
+    existing = frappe.db.exists("Attendance Regularization Request", {
+        "employee": employee,
+        "attendance_date": attendance_date,
+        "status": ["in", ["Pending", "Approved"]]
+    })
+    
+    if existing:
+        frappe.throw(_("A regularization request already exists for this date"))
+        
+    # Get approver (Reports To)
+    approver = frappe.db.get_value("Employee", employee, "reports_to")
+    
+    # Combine date and time
+    if check_in and len(check_in) <= 5: # Format HH:MM
+        check_in = f"{attendance_date} {check_in}:00"
+    
+    if check_out and len(check_out) <= 5: # Format HH:MM
+        check_out = f"{attendance_date} {check_out}:00"
+
+    doc = frappe.get_doc({
+        "doctype": "Attendance Regularization Request",
+        "employee": employee,
+        "attendance_date": attendance_date,
+        "requested_in": check_in,
+        "requested_out": check_out,
+        "reason": reason,
+        "approver": approver,
+        "status": "Pending"
+    })
+    
+    doc.insert(ignore_permissions=True)
+    frappe.db.commit()
+    
+    return doc.as_dict()
+
+@frappe.whitelist()
+def get_regularization_requests(employee=None):
+    """
+    Get regularization requests for an employee
+    """
+    current_user = frappe.session.user
+    print(f"DEBUG: get_regularization_requests called with employee={employee}, user={current_user}")
+    
+    # If employee is not provided, get employee for current user
+    if not employee:
+        employee = frappe.db.get_value("Employee", {"user_id": current_user}, "name")
+        print(f"DEBUG: Resolved employee for user {current_user}: {employee}")
+        if not employee:
+            print("DEBUG: No employee found for user")
+            return [] # Return empty if no employee found
+            
+    requests = frappe.get_all("Attendance Regularization Request",
+        filters={"employee": employee},
+        fields=["name", "attendance_date", "requested_in", "requested_out", "reason", "status", "approver"],
+        order_by="creation desc"
+    )
+    
+    return requests
