@@ -965,13 +965,14 @@ def get_employee_requests(doctype):
 
 
 @frappe.whitelist()
-def create_employee(first_name, last_name, email, password, designation, gender, date_of_birth, date_of_joining, company, reports_to, office, roles=None):
+def create_employee(first_name, last_name, email, password, designation, gender, date_of_birth, date_of_joining, company, reports_to, office, roles=None, holiday_list=None):
     """
     Create a new User and Employee document.
     
     Args:
         roles: List of user roles - must include "Employee", can also include "Manager" and/or "HR Admin"
               If not provided, defaults to ["Employee"]
+        holiday_list: Holiday List name to assign to the employee (optional)
     """
     # Check permissions
     if "HR Admin" not in frappe.get_roles(frappe.session.user):
@@ -1029,6 +1030,14 @@ def create_employee(first_name, last_name, email, password, designation, gender,
         "status": "Active",
         "allowed_locations": [{"office": office}]
     })
+    
+    # Set holiday_list if provided
+    if holiday_list:
+        # Validate that holiday_list exists
+        if not frappe.db.exists("Holiday List", holiday_list):
+            frappe.throw(_("Holiday List '{0}' does not exist").format(holiday_list))
+        employee.holiday_list = holiday_list
+    
     employee.insert(ignore_permissions=True)
     
     # 3. Auto-assign Manager role to the person in reports_to if they don't have it
@@ -1050,9 +1059,12 @@ def create_employee(first_name, last_name, email, password, designation, gender,
 
 
 @frappe.whitelist()
-def update_employee(employee_id, first_name, last_name, email, designation, reports_to, status, office, password=None):
+def update_employee(employee_id, first_name, last_name, email, designation, reports_to, status, office, password=None, holiday_list=None):
     """
     Update Employee and User details.
+    
+    Args:
+        holiday_list: Holiday List name to assign to the employee (optional, can be empty string to clear)
     """
     # Check permissions
     if "HR Admin" not in frappe.get_roles(frappe.session.user):
@@ -1070,6 +1082,16 @@ def update_employee(employee_id, first_name, last_name, email, designation, repo
     employee.allowed_locations = []
     if office:
         employee.append("allowed_locations", {"office": office})
+    
+    # Update holiday_list if provided
+    if holiday_list is not None:
+        if holiday_list:  # If not empty string
+            # Validate that holiday_list exists
+            if not frappe.db.exists("Holiday List", holiday_list):
+                frappe.throw(_("Holiday List '{0}' does not exist").format(holiday_list))
+            employee.holiday_list = holiday_list
+        else:  # Empty string means clear the holiday_list
+            employee.holiday_list = None
         
     employee.save(ignore_permissions=True)
     
@@ -1745,13 +1767,13 @@ def get_holidays_for_month(employee=None, month=None, year=None):
     if not company:
         return []
     
-    # Get holiday list from company's default_holiday_list
-    holiday_list = frappe.get_cached_value("Company", company, "default_holiday_list")
+    # Priority 1: Get holiday list from employee's holiday_list field (supports per-employee schedules)
+    holiday_list = frappe.db.get_value("Employee", employee, "holiday_list")
     if not holiday_list:
-        # Fallback: try to get from employee's holiday_list field
-        holiday_list = frappe.db.get_value("Employee", employee, "holiday_list")
+        # Priority 2: Fallback to company's default_holiday_list
+        holiday_list = frappe.get_cached_value("Company", company, "default_holiday_list")
         if not holiday_list:
-            print(f"DEBUG: No holiday list found for company {company} or employee {employee}")
+            print(f"DEBUG: No holiday list found for employee {employee} or company {company}")
             return []
     
     # Calculate start and end dates for the month
