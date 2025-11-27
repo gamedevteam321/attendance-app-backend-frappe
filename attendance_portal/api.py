@@ -249,7 +249,8 @@ def mark_punch(employee, lat, lng, action):
             if action == "IN":
                 frappe.throw(_("You are not within any allowed office location. Please request remote work if working remotely."))
             else:
-                frappe.throw(_("You must be within an office location to punch out when not working remotely."))
+                # For OUT action, throw error - user should use request_punch_out_outside_office API instead
+                frappe.throw(_("You must be within an office location to punch out when not working remotely. Please use the punch out outside office feature."))
         
         location_type = "Office"
         office_location = office_check["office"]
@@ -444,6 +445,119 @@ def mark_punch(employee, lat, lng, action):
 
 
 @frappe.whitelist()
+def request_punch_out_outside_office(employee, lat, lng, reason):
+    """
+    Request punch out outside office location with reason
+    
+    Args:
+        employee: Employee ID
+        lat: Latitude
+        lng: Longitude
+        reason: Reason for punching out outside office
+    
+    Returns:
+        dict: Attendance Log and Punch Out Request documents
+    """
+    # Validate that employee belongs to current user
+    current_user = frappe.session.user
+    employee_user = frappe.db.get_value("Employee", employee, "user_id")
+    
+    if employee_user != current_user:
+        frappe.throw(_("You can only mark attendance for yourself"))
+    
+    if not reason or not reason.strip():
+        frappe.throw(_("Reason is required for punching out outside office"))
+    
+    lat = float(lat)
+    lng = float(lng)
+    attendance_date = today()
+    now_time = now_datetime()
+    
+    # Check if employee has remote work for today
+    remote_check = has_remote_for_date(employee, attendance_date)
+    if remote_check["has_remote"]:
+        frappe.throw(_("You have an active remote work request. Please use regular punch out."))
+    
+    # Find today's attendance log with check_in but no check_out
+    attendance_log_name = frappe.db.get_value(
+        "Attendance Log",
+        {
+            "employee": employee,
+            "attendance_date": attendance_date,
+            "check_in": ["is", "set"],
+            "check_out": ["is", "not set"]
+        }
+    )
+    
+    if not attendance_log_name:
+        frappe.throw(_("No active punch-in found for today. Please punch in first."))
+    
+    # Update attendance log
+    attendance_log = frappe.get_doc("Attendance Log", attendance_log_name)
+    attendance_log.check_out = now_time
+    attendance_log.check_out_lat = lat
+    attendance_log.check_out_lng = lng
+    attendance_log.status = "Pending Approval"
+    
+    # Get employee's reporting manager as approver
+    approver = frappe.db.get_value("Employee", employee, "reports_to")
+    
+    # Add to Punch History
+    attendance_log.append("punch_history", {
+        "punch_type": "OUT",
+        "punch_time": now_time,
+        "latitude": lat,
+        "longitude": lng,
+        "location_type": "Outside Office",
+        "office_location": None
+    })
+    
+    # Calculate total working hours from history
+    total_hours = 0
+    last_in_time = None
+    
+    # Sort history by time to be safe
+    sorted_history = sorted(attendance_log.punch_history, key=lambda x: get_datetime(x.punch_time))
+    
+    for punch in sorted_history:
+        if punch.punch_type == "IN":
+            last_in_time = get_datetime(punch.punch_time)
+        elif punch.punch_type == "OUT" and last_in_time:
+            out_time = get_datetime(punch.punch_time)
+            duration = (out_time - last_in_time).total_seconds() / 3600
+            total_hours += duration
+            last_in_time = None
+    
+    attendance_log.working_hours = round(total_hours, 2)
+    
+    # Save attendance log
+    attendance_log.save(ignore_permissions=True)
+    
+    # Create Punch Out Request
+    punch_out_request = frappe.get_doc({
+        "doctype": "Punch Out Request",
+        "employee": employee,
+        "attendance_date": attendance_date,
+        "attendance_log": attendance_log_name,
+        "check_out_time": now_time,
+        "reason": reason.strip(),
+        "latitude": lat,
+        "longitude": lng,
+        "approver": approver,
+        "status": "Pending"
+    })
+    punch_out_request.insert(ignore_permissions=True)
+    
+    frappe.db.commit()
+    
+    return {
+        "attendance_log": attendance_log.as_dict(),
+        "punch_out_request": punch_out_request.as_dict(),
+        "message": "Punch out request submitted successfully. Waiting for manager approval."
+    }
+
+
+@frappe.whitelist()
 def create_remote_request(employee, from_date, to_date, reason, lat=None, lng=None):
     """
     Create remote working request
@@ -622,7 +736,7 @@ def approve_request(doctype, name, status):
     Returns:
         dict: Updated document
     """
-    if doctype not in ["Remote Working Request", "Attendance Regularization Request", "Leave Application"]:
+    if doctype not in ["Remote Working Request", "Attendance Regularization Request", "Leave Application", "Punch Out Request"]:
         frappe.throw(_("Invalid doctype"))
     
     if status not in ["Approved", "Rejected"]:
@@ -687,6 +801,10 @@ def approve_request(doctype, name, status):
     if doctype == "Remote Working Request":
         update_attendance_from_remote_approval(doc, status)
     
+    # If it's a Punch Out Request, update the attendance log status
+    if doctype == "Punch Out Request":
+        update_attendance_from_punch_out_approval(doc, status)
+    
     frappe.db.commit()
     
     return doc.as_dict()
@@ -721,6 +839,43 @@ def update_attendance_from_remote_approval(remote_request, approval_status):
             attendance_log.status = "Absent"
         
         attendance_log.save(ignore_permissions=True)
+
+
+def update_attendance_from_punch_out_approval(punch_out_request, approval_status):
+    """
+    Update attendance log when punch out request is approved or rejected
+    
+    Args:
+        punch_out_request: Punch Out Request document
+        approval_status: "Approved" or "Rejected"
+    """
+    # Get the linked attendance log
+    if not punch_out_request.attendance_log:
+        return
+    
+    attendance_log = frappe.get_doc("Attendance Log", punch_out_request.attendance_log)
+    
+    if approval_status == "Approved":
+        # Calculate status based on working hours
+        if attendance_log.working_hours and attendance_log.working_hours < 4:
+            attendance_log.status = "Half Day"
+        elif attendance_log.working_hours and attendance_log.working_hours >= 4:
+            attendance_log.status = "Present"
+        else:
+            # Fallback calculation
+            if attendance_log.check_in and attendance_log.check_out:
+                check_in_time = get_datetime(attendance_log.check_in)
+                check_out_time = get_datetime(attendance_log.check_out)
+                duration_hours = (check_out_time - check_in_time).total_seconds() / 3600
+                if duration_hours < 9:
+                    attendance_log.status = "Half Day"
+                else:
+                    attendance_log.status = "Present"
+    elif approval_status == "Rejected":
+        # When rejected, mark as Absent
+        attendance_log.status = "Absent"
+    
+    attendance_log.save(ignore_permissions=True)
 
 
 def update_attendance_from_regularization(regularization_doc):
@@ -887,17 +1042,20 @@ def get_pending_requests():
     """
     current_user = frappe.session.user
     
+    # Get roles first (needed for punch out requests check)
+    roles = frappe.get_roles(current_user)
+    
     # Get employee linked to this user
     employee = frappe.db.get_value("Employee", {"user_id": current_user}, "name")
     
     if not employee:
         # If not an employee, check if HR Admin
-        roles = frappe.get_roles(current_user)
         if "HR Admin" not in roles:
              return {
                 "leave_applications": [],
                 "remote_requests": [],
-                "regularization_requests": []
+                "regularization_requests": [],
+                "punch_out_requests": []
             }
         # HR Admin sees all pending
         filters = {"status": "Open"}
@@ -914,7 +1072,8 @@ def get_pending_requests():
              return {
                 "leave_applications": [],
                 "remote_requests": [],
-                "regularization_requests": []
+                "regularization_requests": [],
+                "punch_out_requests": []
             }
             
         filters = {"employee": ["in", direct_reports], "status": "Open"}
@@ -952,10 +1111,35 @@ def get_pending_requests():
          for req in regularization_requests:
             req["employee_name"] = frappe.db.get_value("Employee", req.employee, "employee_name")
     
+    # Fetch Punch Out Requests
+    punch_out_requests = []
+    if frappe.db.exists("DocType", "Punch Out Request"):
+        if not employee or "HR Admin" in roles:
+            # HR Admin sees all pending
+            punch_out_filters = {"status": "Pending"}
+        else:
+            # Manager sees requests where they are the approver
+            direct_reports = frappe.get_all("Employee", filters={"reports_to": employee}, pluck="name")
+            if direct_reports:
+                punch_out_filters = {"approver": employee, "status": "Pending"}
+            else:
+                # No direct reports, return empty
+                punch_out_filters = {"status": "Pending", "employee": "NONEXISTENT"}
+        
+        punch_out_requests = frappe.get_all(
+            "Punch Out Request",
+            filters=punch_out_filters,
+            fields=["name", "employee", "attendance_date", "attendance_log", "check_out_time", "reason", "latitude", "longitude", "status", "creation"],
+            order_by="creation desc"
+        )
+        for req in punch_out_requests:
+            req["employee_name"] = frappe.db.get_value("Employee", req.employee, "employee_name")
+    
     return {
         "leave_applications": leave_applications,
         "remote_requests": remote_requests,
-        "regularization_requests": regularization_requests
+        "regularization_requests": regularization_requests,
+        "punch_out_requests": punch_out_requests
     }
 
 
@@ -982,7 +1166,8 @@ def get_approval_history():
         return {
             "leave_applications": [],
             "remote_requests": [],
-            "regularization_requests": []
+            "regularization_requests": [],
+            "punch_out_requests": []
         }
     
     # For HR Admin: get all approved/rejected requests
@@ -991,6 +1176,7 @@ def get_approval_history():
         leave_filters = {"status": ["in", ["Approved", "Rejected"]]}
         remote_filters = {"status": ["in", ["Approved", "Rejected"]]}
         reg_filters = {"status": ["in", ["Approved", "Rejected"]]}
+        punch_out_filters = {"status": ["in", ["Approved", "Rejected"]]}
     else:
         # Manager: get requests from direct reports
         direct_reports = frappe.get_all("Employee", filters={"reports_to": employee}, pluck="name")
@@ -998,11 +1184,13 @@ def get_approval_history():
             return {
                 "leave_applications": [],
                 "remote_requests": [],
-                "regularization_requests": []
+                "regularization_requests": [],
+                "punch_out_requests": []
             }
         leave_filters = {"employee": ["in", direct_reports], "status": ["in", ["Approved", "Rejected"]]}
         remote_filters = {"approver": employee, "status": ["in", ["Approved", "Rejected"]]}
         reg_filters = {"approver": employee, "status": ["in", ["Approved", "Rejected"]]}
+        punch_out_filters = {"approver": employee, "status": ["in", ["Approved", "Rejected"]]}
     
     # Fetch Leave Applications (approved/rejected)
     leave_applications = frappe.get_all(
@@ -1084,10 +1272,38 @@ def get_approval_history():
                     req["approved_by_id"] = None
             req["approved_at"] = req.modified
     
+    # Fetch Punch Out Requests (approved/rejected)
+    punch_out_requests = []
+    if frappe.db.exists("DocType", "Punch Out Request"):
+        punch_out_requests = frappe.get_all(
+            "Punch Out Request",
+            filters=punch_out_filters,
+            fields=["name", "employee", "attendance_date", "attendance_log", "check_out_time", "reason", "latitude", "longitude", "status", "creation", "modified", "modified_by"],
+            order_by="modified desc",
+            limit=100
+        )
+        
+        # Add employee_name and approver info
+        for req in punch_out_requests:
+            # Get employee_name from Employee table
+            req["employee_name"] = frappe.db.get_value("Employee", req.employee, "employee_name")
+            
+            approver_user = req.modified_by
+            if approver_user:
+                approver_employee = frappe.db.get_value("Employee", {"user_id": approver_user}, ["name", "employee_name"], as_dict=True)
+                if approver_employee:
+                    req["approved_by"] = approver_employee.employee_name
+                    req["approved_by_id"] = approver_employee.name
+                else:
+                    req["approved_by"] = approver_user
+                    req["approved_by_id"] = None
+            req["approved_at"] = req.modified
+    
     return {
         "leave_applications": leave_applications,
         "remote_requests": remote_requests,
-        "regularization_requests": regularization_requests
+        "regularization_requests": regularization_requests,
+        "punch_out_requests": punch_out_requests
     }
 
 
@@ -1443,6 +1659,35 @@ def get_notifications(limit=20):
         except Exception:
             # Remote Work Request DocType doesn't exist, skip
             pass
+        
+        # Pending punch out requests (only if DocType exists)
+        try:
+            if frappe.db.exists("DocType", "Punch Out Request"):
+                punch_out_requests = frappe.get_all(
+                    "Punch Out Request",
+                    filters={
+                        "approver": employee,
+                        "status": "Pending"
+                    },
+                    fields=["name", "employee", "attendance_date", "check_out_time", "creation"],
+                    order_by="creation desc",
+                    limit=limit
+                )
+                
+                for punch_out in punch_out_requests:
+                    employee_name = frappe.db.get_value("Employee", punch_out.employee, "employee_name")
+                    notifications.append({
+                        "id": f"punchout-{punch_out.name}",
+                        "type": "punchout_pending",
+                        "title": "Punch Out Request Pending",
+                        "message": f"{employee_name} requested punch out outside office on {punch_out.attendance_date}",
+                        "timestamp": punch_out.creation,
+                        "link": "/approvals",
+                        "unread": True
+                    })
+        except Exception:
+            # Punch Out Request DocType doesn't exist, skip
+            pass
     
     # For employees: get status updates on their own requests
     # Leave requests (approved/rejected in last 7 days)
@@ -1502,6 +1747,36 @@ def get_notifications(limit=20):
             })
     except Exception:
         # Remote Work Request DocType doesn't exist, skip
+        pass
+    
+    # Punch out requests (approved/rejected in last 7 days) - only if DocType exists
+    try:
+        if frappe.db.exists("DocType", "Punch Out Request"):
+            employee_punch_out = frappe.get_all(
+                "Punch Out Request",
+                filters={
+                    "employee": employee,
+                    "status": ["in", ["Approved", "Rejected"]],
+                    "modified": [">=", frappe.utils.add_days(today(), -7)]
+                },
+                fields=["name", "status", "attendance_date", "check_out_time", "modified"],
+                order_by="modified desc",
+                limit=limit
+            )
+            
+            for punch_out in employee_punch_out:
+                status_text = "approved" if punch_out.status == "Approved" else "rejected"
+                notifications.append({
+                    "id": f"punchout-status-{punch_out.name}",
+                    "type": f"punchout_{status_text}",
+                    "title": f"Punch Out Request {punch_out.status}",
+                    "message": f"Your punch out request for {punch_out.attendance_date} was {status_text}",
+                    "timestamp": punch_out.modified,
+                    "link": "/attendance/logs",
+                    "unread": True
+                })
+    except Exception:
+        # Punch Out Request DocType doesn't exist, skip
         pass
     
     # Sort by timestamp descending
