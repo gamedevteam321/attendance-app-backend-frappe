@@ -255,54 +255,64 @@ def mark_punch(employee, lat, lng, action):
         office_location = office_check["office"]
 
     if action == "IN":
-        # Check if there's already an attendance log for today
+        # Check if there's already an attendance log for TODAY (not yesterday) with no check_out
+        # This ensures users can punch in fresh after midnight even if they forgot to punch out yesterday
         attendance_log_name = frappe.db.get_value(
             "Attendance Log",
-            {"employee": employee, "attendance_date": attendance_date}
+            {
+                "employee": employee, 
+                "attendance_date": attendance_date,  # Only check for today's date
+                "check_out": ["is", "not set"]  # Only if not punched out
+            }
         )
         
         if attendance_log_name:
             attendance_log = frappe.get_doc("Attendance Log", attendance_log_name)
             
-            # If already punched in (check_out is None)
-            if not attendance_log.check_out:
-                # Allow updating punch-in if:
-                # 1. Status is "Pending Approval" AND
-                # 2. Remote request is pending
-                # This allows users to update their punch-in time when remote request is pending
-                if attendance_log.status == "Pending Approval" and remote_status == "Pending":
-                    # Update the existing punch-in with new time and location
+            # Double-check that this is today's log (safety check)
+            if attendance_log.attendance_date != attendance_date:
+                # This shouldn't happen, but if it does, create a new log for today
+                attendance_log_name = None
+            else:
+                # If already punched in today (check_out is None)
+                if not attendance_log.check_out:
+                    # Allow updating punch-in if:
+                    # 1. Status is "Pending Approval" AND
+                    # 2. Remote request is pending
+                    # This allows users to update their punch-in time when remote request is pending
+                    if attendance_log.status == "Pending Approval" and remote_status == "Pending":
+                        # Update the existing punch-in with new time and location
+                        attendance_log.check_in = now_time
+                        attendance_log.check_in_lat = lat
+                        attendance_log.check_in_lng = lng
+                        attendance_log.location_type = location_type
+                        attendance_log.office_location = office_location
+                        attendance_log.working_remote_req = remote_req
+                        attendance_log.status = "Pending Approval"
+                    else:
+                        # Otherwise, throw error - user must punch out first
+                        frappe.throw(_("You have already punched in today. Please punch out first."), exc=frappe.exceptions.DuplicateEntryError)
+                else:
+                    # Re-punching IN: Reset check_out and update check_in
+                    attendance_log.check_out = None
+                    attendance_log.check_out_lat = None
+                    attendance_log.check_out_lng = None
                     attendance_log.check_in = now_time
                     attendance_log.check_in_lat = lat
                     attendance_log.check_in_lng = lng
                     attendance_log.location_type = location_type
                     attendance_log.office_location = office_location
                     attendance_log.working_remote_req = remote_req
-                    attendance_log.status = "Pending Approval"
-                else:
-                    # Otherwise, throw error - user must punch out first
-                    frappe.throw(_("You have already punched in today. Please punch out first."), exc=frappe.exceptions.DuplicateEntryError)
-            else:
-                # Re-punching IN: Reset check_out and update check_in
-                attendance_log.check_out = None
-                attendance_log.check_out_lat = None
-                attendance_log.check_out_lng = None
-                attendance_log.check_in = now_time
-                attendance_log.check_in_lat = lat
-                attendance_log.check_in_lng = lng
-                attendance_log.location_type = location_type
-                attendance_log.office_location = office_location
-                attendance_log.working_remote_req = remote_req
-                
-                # Set status based on remote request approval status
-                if remote_status == "Pending":
-                    attendance_log.status = "Pending Approval"
-                elif remote_status == "Approved":
-                    attendance_log.status = "Present"
-                else:
-                    attendance_log.status = "Present"
-            
-        else:
+                    
+                    # Set status based on remote request approval status
+                    if remote_status == "Pending":
+                        attendance_log.status = "Pending Approval"
+                    elif remote_status == "Approved":
+                        attendance_log.status = "Present"
+                    else:
+                        attendance_log.status = "Present"
+        
+        if not attendance_log_name:
             # Create new attendance log
             attendance_log = frappe.get_doc({
                 "doctype": "Attendance Log",
@@ -611,9 +621,26 @@ def approve_request(doctype, name, status):
     if not is_authorized and approver_user != current_user:
         frappe.throw(_("You are not authorized to approve this request"))
     
+    # Get current user's employee ID for tracking
+    current_employee = frappe.db.get_value("Employee", {"user_id": current_user}, "name")
+    
     # Update status
     doc.status = status
     doc.save(ignore_permissions=True)
+    
+    # Track approval history using Frappe's comment system
+    try:
+        frappe.get_doc({
+            "doctype": "Comment",
+            "comment_type": "Comment",
+            "reference_doctype": doctype,
+            "reference_name": name,
+            "content": f"Request {status.lower()} by {current_user}" + (f" (Employee: {current_employee})" if current_employee else ""),
+            "comment_by": current_user
+        }).insert(ignore_permissions=True)
+    except:
+        # If comment fails, continue anyway
+        pass
     
     # If approved and submittable, submit the document
     if status == "Approved" and doc.meta.is_submittable:
@@ -891,6 +918,138 @@ def get_pending_requests():
         )
          for req in regularization_requests:
             req["employee_name"] = frappe.db.get_value("Employee", req.employee, "employee_name")
+    
+    return {
+        "leave_applications": leave_applications,
+        "remote_requests": remote_requests,
+        "regularization_requests": regularization_requests
+    }
+
+
+@frappe.whitelist()
+def get_approval_history():
+    """
+    Get approval history for current user (Manager/HR Admin)
+    Shows all approved/rejected requests they have processed
+    
+    Returns:
+        dict: {
+            leave_applications: list,
+            remote_requests: list,
+            regularization_requests: list
+        }
+    """
+    current_user = frappe.session.user
+    roles = frappe.get_roles(current_user)
+    
+    # Get employee linked to this user
+    employee = frappe.db.get_value("Employee", {"user_id": current_user}, "name")
+    
+    if not employee and "HR Admin" not in roles:
+        return {
+            "leave_applications": [],
+            "remote_requests": [],
+            "regularization_requests": []
+        }
+    
+    # For HR Admin: get all approved/rejected requests
+    # For Manager: get requests from their direct reports
+    if "HR Admin" in roles:
+        leave_filters = {"status": ["in", ["Approved", "Rejected"]]}
+        remote_filters = {"status": ["in", ["Approved", "Rejected"]]}
+        reg_filters = {"status": ["in", ["Approved", "Rejected"]]}
+    else:
+        # Manager: get requests from direct reports
+        direct_reports = frappe.get_all("Employee", filters={"reports_to": employee}, pluck="name")
+        if not direct_reports:
+            return {
+                "leave_applications": [],
+                "remote_requests": [],
+                "regularization_requests": []
+            }
+        leave_filters = {"employee": ["in", direct_reports], "status": ["in", ["Approved", "Rejected"]]}
+        remote_filters = {"approver": employee, "status": ["in", ["Approved", "Rejected"]]}
+        reg_filters = {"approver": employee, "status": ["in", ["Approved", "Rejected"]]}
+    
+    # Fetch Leave Applications (approved/rejected)
+    leave_applications = frappe.get_all(
+        "Leave Application",
+        filters=leave_filters,
+        fields=["name", "employee", "leave_type", "from_date", "to_date", "total_leave_days", "description", "status", "posting_date", "modified", "modified_by"],
+        order_by="modified desc",
+        limit=100
+    )
+    
+    # Add employee_name and approver info to leave applications
+    for leave in leave_applications:
+        # Get employee_name from Employee table
+        leave["employee_name"] = frappe.db.get_value("Employee", leave.employee, "employee_name")
+        
+        # Get the approver from modified_by or from comments
+        approver_user = leave.modified_by
+        if approver_user:
+            approver_employee = frappe.db.get_value("Employee", {"user_id": approver_user}, ["name", "employee_name"], as_dict=True)
+            if approver_employee:
+                leave["approved_by"] = approver_employee.employee_name
+                leave["approved_by_id"] = approver_employee.name
+            else:
+                leave["approved_by"] = approver_user
+                leave["approved_by_id"] = None
+        leave["approved_at"] = leave.modified
+    
+    # Fetch Remote Working Requests (approved/rejected)
+    remote_requests = []
+    if frappe.db.exists("DocType", "Remote Working Request"):
+        remote_requests = frappe.get_all(
+            "Remote Working Request",
+            filters=remote_filters,
+            fields=["name", "employee", "from_date", "to_date", "reason", "status", "creation", "modified", "modified_by"],
+            order_by="modified desc",
+            limit=100
+        )
+        
+        # Add employee_name and approver info
+        for req in remote_requests:
+            # Get employee_name from Employee table
+            req["employee_name"] = frappe.db.get_value("Employee", req.employee, "employee_name")
+            
+            approver_user = req.modified_by
+            if approver_user:
+                approver_employee = frappe.db.get_value("Employee", {"user_id": approver_user}, ["name", "employee_name"], as_dict=True)
+                if approver_employee:
+                    req["approved_by"] = approver_employee.employee_name
+                    req["approved_by_id"] = approver_employee.name
+                else:
+                    req["approved_by"] = approver_user
+                    req["approved_by_id"] = None
+            req["approved_at"] = req.modified
+    
+    # Fetch Attendance Regularization Requests (approved/rejected)
+    regularization_requests = []
+    if frappe.db.exists("DocType", "Attendance Regularization Request"):
+        regularization_requests = frappe.get_all(
+            "Attendance Regularization Request",
+            filters=reg_filters,
+            fields=["name", "employee", "attendance_date", "reason", "status", "creation", "modified", "modified_by"],
+            order_by="modified desc",
+            limit=100
+        )
+        
+        # Add employee_name and approver info
+        for req in regularization_requests:
+            # Get employee_name from Employee table
+            req["employee_name"] = frappe.db.get_value("Employee", req.employee, "employee_name")
+            
+            approver_user = req.modified_by
+            if approver_user:
+                approver_employee = frappe.db.get_value("Employee", {"user_id": approver_user}, ["name", "employee_name"], as_dict=True)
+                if approver_employee:
+                    req["approved_by"] = approver_employee.employee_name
+                    req["approved_by_id"] = approver_employee.name
+                else:
+                    req["approved_by"] = approver_user
+                    req["approved_by_id"] = None
+            req["approved_at"] = req.modified
     
     return {
         "leave_applications": leave_applications,
@@ -1644,9 +1803,117 @@ def get_attendance_logs(employee=None, month=None, year=None):
             "employee": employee,
             "attendance_date": ["between", [start_date, end_date]]
         },
-        fields=["name", "attendance_date", "check_in", "check_out", "status", "working_hours"],
+        fields=["name", "attendance_date", "check_in", "check_out", "status", "working_hours", "location_type"],
         order_by="attendance_date asc"
     )
+    
+    # Fetch punch history for each log
+    for log in logs:
+        log["punch_history"] = frappe.get_all(
+            "Attendance Punch History",
+            filters={"parent": log.name},
+            fields=["punch_type", "punch_time", "location_type", "office_location"],
+            order_by="punch_time asc"
+        )
+    
+    return logs
+
+
+@frappe.whitelist()
+def get_all_employees_attendance_for_date(date):
+    """
+    Get all employees' attendance logs for a specific date
+    Only accessible by HR Admin or Manager
+    
+    Args:
+        date: Date in YYYY-MM-DD format
+    
+    Returns:
+        list: List of attendance logs with employee information
+    """
+    current_user = frappe.session.user
+    roles = frappe.get_roles(current_user)
+    
+    # Check permissions
+    if "HR Admin" not in roles and "Manager" not in roles:
+        frappe.throw(_("Not authorized. Only HR Admin or Manager can view all employees' attendance."))
+    
+    # Get employee linked to current user
+    current_employee = frappe.db.get_value("Employee", {"user_id": current_user}, "name")
+    
+    # For Manager: get only direct reports
+    # For HR Admin: get all active employees
+    if "HR Admin" in roles:
+        employee_filters = {"status": "Active"}
+    else:
+        # Manager: get direct reports
+        direct_reports = frappe.get_all("Employee", filters={"reports_to": current_employee}, pluck="name")
+        if not direct_reports:
+            return []
+        employee_filters = {"name": ["in", direct_reports], "status": "Active"}
+    
+    # Get all active employees (or direct reports for manager)
+    employees = frappe.get_all(
+        "Employee",
+        filters=employee_filters,
+        fields=["name", "employee_name"]
+    )
+    
+    if not employees:
+        return []
+    
+    employee_ids = [emp.name for emp in employees]
+    
+    # Get attendance logs for the date
+    logs = frappe.get_all(
+        "Attendance Log",
+        filters={
+            "employee": ["in", employee_ids],
+            "attendance_date": date
+        },
+        fields=["name", "employee", "attendance_date", "check_in", "check_out", "status", "working_hours", "location_type"],
+        order_by="employee asc"
+    )
+    
+    # Fetch punch history for each log
+    for log in logs:
+        log["punch_history"] = frappe.get_all(
+            "Attendance Punch History",
+            filters={"parent": log.name},
+            fields=["punch_type", "punch_time", "location_type", "office_location"],
+            order_by="punch_time asc"
+        )
+    
+    # Create a map of employee_id to employee info
+    employee_map = {emp.name: emp for emp in employees}
+    
+    # Add employee information to each log
+    for log in logs:
+        emp_info = employee_map.get(log.employee, {})
+        log["employee_name"] = emp_info.get("employee_name", "")
+        log["employee_id"] = log.employee  # Use employee name as ID
+    
+    # Also include employees who don't have attendance logs (marked as absent or no record)
+    logged_employee_ids = {log.employee for log in logs}
+    missing_employees = [emp for emp in employees if emp.name not in logged_employee_ids]
+    
+    # Add missing employees as "No Record" entries
+    for emp in missing_employees:
+        logs.append({
+            "employee": emp.name,
+            "employee_name": emp.employee_name,
+            "employee_id": emp.name,  # Use employee name as ID
+            "attendance_date": date,
+            "check_in": None,
+            "check_out": None,
+            "status": "Absent",
+            "working_hours": 0,
+            "location_type": None,
+            "punch_history": []
+        })
+    
+    # Sort by employee name
+    logs.sort(key=lambda x: x.get("employee_name", ""))
     
     return logs
 
@@ -1814,3 +2081,295 @@ def get_holidays_for_month(employee=None, month=None, year=None):
     print(f"DEBUG: Found {len(holiday_dates)} holidays: {holiday_dates}")
     
     return holiday_dates
+
+
+@frappe.whitelist()
+def get_attendance_report_for_csv(from_date=None, to_date=None, employees=None):
+    """
+    Get all employee attendance data for CSV export (HR Admin only)
+    
+    Args:
+        from_date: Start date (YYYY-MM-DD format, optional, defaults to 30 days ago)
+        to_date: End date (YYYY-MM-DD format, optional, defaults to today)
+        employees: List of employee IDs to filter (optional, if None or empty, gets all active employees)
+    
+    Returns:
+        list: List of attendance records with employee info, dates, check in/out, hours, and status
+    """
+    # Check permissions - only HR Admin can access
+    if "HR Admin" not in frappe.get_roles(frappe.session.user):
+        frappe.throw(_("Not authorized. Only HR Admin can access attendance reports."))
+    
+    from datetime import datetime, timedelta
+    from frappe.utils import getdate
+    
+    # Set default date range if not provided
+    if not to_date:
+        to_date = today()
+    if not from_date:
+        from_date = (getdate(to_date) - timedelta(days=30)).strftime("%Y-%m-%d")
+    
+    # Handle employees parameter - can be list or string
+    employee_filter = {"status": "Active"}
+    if employees:
+        if isinstance(employees, str):
+            # Single employee ID
+            employee_filter["name"] = employees
+        elif isinstance(employees, list) and len(employees) > 0:
+            # Multiple employee IDs
+            employee_filter["name"] = ["in", employees]
+    
+    # Get employees based on filter
+    employees_list = frappe.get_all(
+        "Employee",
+        filters=employee_filter,
+        fields=["name", "employee_name"]
+    )
+    
+    if not employees_list:
+        return []
+    
+    # Get employee IDs for filtering attendance logs
+    employee_ids = [emp.name for emp in employees_list]
+    
+    # Get all attendance logs in the date range for selected employees
+    attendance_logs = frappe.get_all(
+        "Attendance Log",
+        filters={
+            "attendance_date": ["between", [from_date, to_date]],
+            "employee": ["in", employee_ids]
+        },
+        fields=[
+            "name", "employee", "attendance_date", "check_in", "check_out", 
+            "status", "working_hours", "location_type"
+        ],
+        order_by="attendance_date asc, employee asc"
+    )
+    
+    # Create a dictionary for quick lookup
+    logs_by_employee_date = {}
+    for log in attendance_logs:
+        key = f"{log.employee}_{log.attendance_date}"
+        logs_by_employee_date[key] = log
+    
+    # Get all leave applications in the date range for selected employees
+    leave_applications = frappe.get_all(
+        "Leave Application",
+        filters={
+            "docstatus": 1,
+            "status": "Approved",
+            "from_date": ["<=", to_date],
+            "to_date": [">=", from_date],
+            "employee": ["in", employee_ids]
+        },
+        fields=["employee", "from_date", "to_date", "leave_type", "half_day", "half_day_date"]
+    )
+    
+    # Create leave dates dictionary
+    leave_dates = {}
+    for leave in leave_applications:
+        from_dt = getdate(leave.from_date)
+        to_dt = getdate(leave.to_date)
+        current_date = from_dt
+        while current_date <= to_dt:
+            date_str = current_date.strftime("%Y-%m-%d")
+            if date_str >= from_date and date_str <= to_date:
+                if leave.half_day and leave.half_day_date:
+                    # Half day leave
+                    if getdate(leave.half_day_date) == current_date:
+                        leave_dates[f"{leave.employee}_{date_str}"] = {"type": "Half Day Leave", "leave_type": leave.leave_type}
+                    else:
+                        leave_dates[f"{leave.employee}_{date_str}"] = {"type": "On Leave", "leave_type": leave.leave_type}
+                else:
+                    leave_dates[f"{leave.employee}_{date_str}"] = {"type": "On Leave", "leave_type": leave.leave_type}
+            current_date += timedelta(days=1)
+    
+    # Get holiday lists for selected employees
+    employee_holidays = {}
+    for emp in employees_list:
+        # Get employee's holiday list
+        holiday_list = frappe.db.get_value("Employee", emp.name, "holiday_list")
+        if not holiday_list:
+            company = frappe.db.get_value("Employee", emp.name, "company")
+            if company:
+                holiday_list = frappe.get_cached_value("Company", company, "default_holiday_list")
+        
+        if holiday_list:
+            holidays = frappe.get_all(
+                "Holiday",
+                filters={
+                    "parent": holiday_list,
+                    "holiday_date": ["between", [from_date, to_date]]
+                },
+                fields=["holiday_date"],
+                pluck="holiday_date"
+            )
+            for holiday_date in holidays:
+                if isinstance(holiday_date, str):
+                    date_str = holiday_date.split(' ')[0]
+                else:
+                    date_str = holiday_date.strftime("%Y-%m-%d")
+                if date_str >= from_date and date_str <= to_date:
+                    employee_holidays[f"{emp.name}_{date_str}"] = True
+    
+    # Build report data
+    report_data = []
+    
+    # Generate date range
+    from_dt = getdate(from_date)
+    to_dt = getdate(to_date)
+    current_date = from_dt
+    
+    while current_date <= to_dt:
+        date_str = current_date.strftime("%Y-%m-%d")
+        
+        for emp in employees_list:
+            key = f"{emp.name}_{date_str}"
+            log = logs_by_employee_date.get(key)
+            leave_info = leave_dates.get(key)
+            is_holiday = employee_holidays.get(key, False)
+            
+            # Determine status code
+            status_code = "A"  # Default to Absent
+            
+            if is_holiday:
+                status_code = "O"
+            elif leave_info:
+                if leave_info["type"] == "Half Day Leave":
+                    status_code = "HD"
+                else:
+                    status_code = "L"
+            elif log:
+                has_check_in = bool(log.check_in)
+                has_check_out = bool(log.check_out)
+                
+                if log.location_type and (log.location_type == "Remote" or log.location_type == "Work From Home"):
+                    status_code = "WR"
+                elif log.status == "Present":
+                    if has_check_in and not has_check_out:
+                        status_code = "P:A"
+                    elif not has_check_in and has_check_out:
+                        status_code = "A:P"
+                    else:
+                        status_code = "P"
+                elif log.status == "Half Day":
+                    status_code = "HD"
+                elif log.status == "Absent":
+                    status_code = "A"
+                elif log.status == "Pending Approval":
+                    status_code = "PA"
+                else:
+                    status_code = log.status[:2].upper() if log.status else "A"
+            
+            # Get first check in and last check out from punch history
+            first_check_in = None
+            last_check_out = None
+            
+            if log:
+                # Get punch history
+                punch_history = frappe.get_all(
+                    "Attendance Punch History",
+                    filters={"parent": log.name},
+                    fields=["punch_type", "punch_time"],
+                    order_by="punch_time asc"
+                )
+                
+                for punch in punch_history:
+                    if punch.punch_type == "IN" and not first_check_in:
+                        first_check_in = punch.punch_time
+                    if punch.punch_type == "OUT":
+                        last_check_out = punch.punch_time
+                
+                # Fallback to check_in/check_out if no history
+                if not first_check_in and log.check_in:
+                    first_check_in = log.check_in
+                if not last_check_out and log.check_out:
+                    last_check_out = log.check_out
+            
+            # Format times
+            first_check_in_str = ""
+            last_check_out_str = ""
+            
+            if first_check_in:
+                if isinstance(first_check_in, str):
+                    try:
+                        dt = datetime.fromisoformat(first_check_in.replace('Z', '+00:00'))
+                        first_check_in_str = dt.strftime("%H:%M:%S")
+                    except:
+                        first_check_in_str = str(first_check_in)
+                else:
+                    first_check_in_str = first_check_in.strftime("%H:%M:%S")
+            
+            if last_check_out:
+                if isinstance(last_check_out, str):
+                    try:
+                        dt = datetime.fromisoformat(last_check_out.replace('Z', '+00:00'))
+                        last_check_out_str = dt.strftime("%H:%M:%S")
+                    except:
+                        last_check_out_str = str(last_check_out)
+                else:
+                    last_check_out_str = last_check_out.strftime("%H:%M:%S")
+            
+            # Get working hours
+            working_hours = log.working_hours if log and log.working_hours else 0.0
+            
+            report_data.append({
+                "employee_name": emp.employee_name,
+                "employee_id": emp.name,
+                "date": date_str,
+                "first_check_in": first_check_in_str,
+                "last_check_out": last_check_out_str,
+                "working_hours": round(working_hours, 2),
+                "status": status_code
+            })
+        
+        current_date += timedelta(days=1)
+    
+    # Calculate summary statistics for each employee
+    summary_data = []
+    employee_stats = {}
+    
+    # Initialize stats for each employee
+    for emp in employees_list:
+        employee_stats[emp.name] = {
+            "employee_name": emp.employee_name,
+            "employee_id": emp.name,
+            "worked_days": 0,
+            "total_days": 0,
+            "total_working_hours": 0.0
+        }
+    
+    # Calculate stats from report data
+    for record in report_data:
+        emp_id = record["employee_id"]
+        if emp_id in employee_stats:
+            employee_stats[emp_id]["total_days"] += 1
+            
+            # Count worked days (exclude Absent and Holiday/Off)
+            if record["status"] not in ["A", "O"]:
+                employee_stats[emp_id]["worked_days"] += 1
+            
+            # Sum working hours
+            employee_stats[emp_id]["total_working_hours"] += record["working_hours"] or 0.0
+    
+    # Build summary data
+    for emp_id, stats in employee_stats.items():
+        # Calculate total working hours (worked days * 9 hours)
+        total_working_hours_expected = stats["worked_days"] * 9.0
+        
+        summary_data.append({
+            "employee_name": stats["employee_name"],
+            "employee_id": stats["employee_id"],
+            "worked_days": stats["worked_days"],
+            "total_days": stats["total_days"],
+            "working_hours": round(stats["total_working_hours"], 2),
+            "total_working_hours": round(total_working_hours_expected, 2)
+        })
+    
+    # Sort summary by employee name for better readability
+    summary_data.sort(key=lambda x: x["employee_name"])
+    
+    return {
+        "summary": summary_data,
+        "details": report_data
+    }
