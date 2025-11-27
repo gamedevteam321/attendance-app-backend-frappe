@@ -255,16 +255,21 @@ def mark_punch(employee, lat, lng, action):
         office_location = office_check["office"]
 
     if action == "IN":
-        # Check if there's already an attendance log for TODAY (not yesterday) with no check_out
-        # This ensures users can punch in fresh after midnight even if they forgot to punch out yesterday
+        # Check if there's already an attendance log for TODAY (regardless of check_out status)
+        # This allows users to punch in again even after completing a full cycle
         attendance_log_name = frappe.db.get_value(
             "Attendance Log",
             {
                 "employee": employee, 
-                "attendance_date": attendance_date,  # Only check for today's date
-                "check_out": ["is", "not set"]  # Only if not punched out
+                "attendance_date": attendance_date  # Only check for today's date
             }
         )
+        
+        # Fallback: Also check by auto-generated name format in case query didn't find it
+        if not attendance_log_name:
+            expected_name = f"ATT-{employee}-{attendance_date}"
+            if frappe.db.exists("Attendance Log", expected_name):
+                attendance_log_name = expected_name
         
         if attendance_log_name:
             attendance_log = frappe.get_doc("Attendance Log", attendance_log_name)
@@ -273,6 +278,7 @@ def mark_punch(employee, lat, lng, action):
             if attendance_log.attendance_date != attendance_date:
                 # This shouldn't happen, but if it does, create a new log for today
                 attendance_log_name = None
+                attendance_log = None
             else:
                 # If already punched in today (check_out is None)
                 if not attendance_log.check_out:
@@ -312,20 +318,42 @@ def mark_punch(employee, lat, lng, action):
                     else:
                         attendance_log.status = "Present"
         
-        if not attendance_log_name:
-            # Create new attendance log
-            attendance_log = frappe.get_doc({
-                "doctype": "Attendance Log",
-                "employee": employee,
-                "attendance_date": attendance_date,
-                "check_in": now_time,
-                "location_type": location_type,
-                "office_location": office_location,
-                "check_in_lat": lat,
-                "check_in_lng": lng,
-                "working_remote_req": remote_req,
-                "status": "Pending Approval" if remote_status == "Pending" else "Present"
-            })
+        if not attendance_log_name or attendance_log is None:
+            # Check one more time if log exists before creating (race condition protection)
+            expected_name = f"ATT-{employee}-{attendance_date}"
+            if frappe.db.exists("Attendance Log", expected_name):
+                # Log exists, load it instead of creating new
+                attendance_log = frappe.get_doc("Attendance Log", expected_name)
+                # Handle re-punching IN
+                attendance_log.check_out = None
+                attendance_log.check_out_lat = None
+                attendance_log.check_out_lng = None
+                attendance_log.check_in = now_time
+                attendance_log.check_in_lat = lat
+                attendance_log.check_in_lng = lng
+                attendance_log.location_type = location_type
+                attendance_log.office_location = office_location
+                attendance_log.working_remote_req = remote_req
+                if remote_status == "Pending":
+                    attendance_log.status = "Pending Approval"
+                elif remote_status == "Approved":
+                    attendance_log.status = "Present"
+                else:
+                    attendance_log.status = "Present"
+            else:
+                # Create new attendance log
+                attendance_log = frappe.get_doc({
+                    "doctype": "Attendance Log",
+                    "employee": employee,
+                    "attendance_date": attendance_date,
+                    "check_in": now_time,
+                    "location_type": location_type,
+                    "office_location": office_location,
+                    "check_in_lat": lat,
+                    "check_in_lng": lng,
+                    "working_remote_req": remote_req,
+                    "status": "Pending Approval" if remote_status == "Pending" else "Present"
+                })
             
     elif action == "OUT":
         # Find today's attendance log with check_in but no check_out
@@ -404,7 +432,12 @@ def mark_punch(employee, lat, lng, action):
         else:
             attendance_log.status = "Present"
     
-    attendance_log.save(ignore_permissions=True)
+    # Save or insert the attendance log
+    # New documents need insert(), existing documents need save()
+    if not attendance_log.name:
+        attendance_log.insert(ignore_permissions=True)
+    else:
+        attendance_log.save(ignore_permissions=True)
     frappe.db.commit()
     
     return attendance_log.as_dict()
