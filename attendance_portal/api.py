@@ -885,6 +885,8 @@ def update_attendance_from_regularization(regularization_doc):
     Args:
         regularization_doc: Attendance Regularization Request document
     """
+    from frappe.utils import get_datetime
+    
     # Check if attendance log exists for that date
     attendance_log_name = frappe.db.get_value(
         "Attendance Log",
@@ -897,10 +899,61 @@ def update_attendance_from_regularization(regularization_doc):
     if attendance_log_name:
         # Update existing log
         attendance_log = frappe.get_doc("Attendance Log", attendance_log_name)
+        current_status = attendance_log.status
+        
+        # Do NOT override if status is "On Leave"
+        if current_status == "On Leave":
+            # Still update check_in/check_out but don't change status
+            if regularization_doc.requested_in:
+                attendance_log.check_in = regularization_doc.requested_in
+            if regularization_doc.requested_out:
+                attendance_log.check_out = regularization_doc.requested_out
+            attendance_log.save(ignore_permissions=True)
+            return
+        
+        # Only override status if it's one of these: Absent, Half Day, P:A, A:P, or WR
+        overrideable_statuses = ["Absent", "Half Day", "Pending Approval"]
+        
+        # Check for partial attendance (P:A or A:P)
+        has_check_in = bool(attendance_log.check_in)
+        has_check_out = bool(attendance_log.check_out)
+        is_partial = (has_check_in and not has_check_out) or (not has_check_in and has_check_out)
+        
+        # Check if it's remote work
+        is_remote = attendance_log.location_type and (
+            attendance_log.location_type == "Remote" or 
+            attendance_log.location_type == "Work From Home"
+        )
+        
+        # Update check_in and check_out
         if regularization_doc.requested_in:
             attendance_log.check_in = regularization_doc.requested_in
         if regularization_doc.requested_out:
             attendance_log.check_out = regularization_doc.requested_out
+        
+        # Override status if it's in the overrideable list, is partial, or is remote
+        if current_status in overrideable_statuses or is_partial or is_remote:
+            # Calculate status based on check_in/check_out times
+            if attendance_log.check_in and attendance_log.check_out:
+                check_in_time = get_datetime(attendance_log.check_in)
+                check_out_time = get_datetime(attendance_log.check_out)
+                duration_hours = (check_out_time - check_in_time).total_seconds() / 3600
+                
+                # Preserve remote location_type if it was remote
+                if is_remote and not attendance_log.location_type:
+                    attendance_log.location_type = "Remote"
+                
+                # Set status based on working hours
+                if duration_hours < 4:
+                    attendance_log.status = "Half Day"
+                else:
+                    attendance_log.status = "Present"
+            elif attendance_log.check_in or attendance_log.check_out:
+                # Partial attendance - keep as Present but might need adjustment
+                attendance_log.status = "Present"
+            else:
+                attendance_log.status = "Present"
+        
         attendance_log.save(ignore_permissions=True)
     else:
         # Create new log
@@ -912,6 +965,18 @@ def update_attendance_from_regularization(regularization_doc):
             "check_out": regularization_doc.requested_out,
             "status": "Present"
         })
+        
+        # Calculate status based on working hours if both times are provided
+        if regularization_doc.requested_in and regularization_doc.requested_out:
+            check_in_time = get_datetime(regularization_doc.requested_in)
+            check_out_time = get_datetime(regularization_doc.requested_out)
+            duration_hours = (check_out_time - check_in_time).total_seconds() / 3600
+            
+            if duration_hours < 4:
+                attendance_log.status = "Half Day"
+            else:
+                attendance_log.status = "Present"
+        
         attendance_log.insert(ignore_permissions=True)
 
 
@@ -1373,7 +1438,7 @@ def get_employee_requests(doctype):
 
 
 @frappe.whitelist()
-def create_employee(first_name, last_name, email, password, designation, gender, date_of_birth, date_of_joining, company, reports_to, office, roles=None, holiday_list=None):
+def create_employee(first_name, last_name, email, password, designation, gender, date_of_birth, date_of_joining, company, reports_to, office=None, offices=None, roles=None, holiday_list=None):
     """
     Create a new User and Employee document.
     
@@ -1424,6 +1489,17 @@ def create_employee(first_name, last_name, email, password, designation, gender,
     user.insert(ignore_permissions=True)
     
     # 2. Create Employee
+    # Handle office locations - support both single office (backward compatibility) and multiple offices
+    allowed_locations = []
+    if offices and isinstance(offices, list) and len(offices) > 0:
+        # Multiple offices provided
+        for office_name in offices:
+            if office_name:  # Skip empty values
+                allowed_locations.append({"office": office_name})
+    elif office:
+        # Single office provided (backward compatibility)
+        allowed_locations.append({"office": office})
+    
     employee = frappe.get_doc({
         "doctype": "Employee",
         "first_name": first_name,
@@ -1436,7 +1512,7 @@ def create_employee(first_name, last_name, email, password, designation, gender,
         "company": company,
         "reports_to": reports_to,
         "status": "Active",
-        "allowed_locations": [{"office": office}]
+        "allowed_locations": allowed_locations
     })
     
     # Set holiday_list if provided
@@ -1467,12 +1543,15 @@ def create_employee(first_name, last_name, email, password, designation, gender,
 
 
 @frappe.whitelist()
-def update_employee(employee_id, first_name, last_name, email, designation, reports_to, status, office, password=None, holiday_list=None):
+def update_employee(employee_id, first_name, last_name, email, designation, reports_to, status, office=None, offices=None, company=None, password=None, holiday_list=None):
     """
     Update Employee and User details.
     
     Args:
         holiday_list: Holiday List name to assign to the employee (optional, can be empty string to clear)
+        offices: List of office location names (optional, for multiple locations)
+        office: Single office location name (optional, for backward compatibility)
+        company: Company name (optional, to change employee's company)
     """
     # Check permissions
     if "HR Admin" not in frappe.get_roles(frappe.session.user):
@@ -1486,9 +1565,20 @@ def update_employee(employee_id, first_name, last_name, email, designation, repo
     employee.reports_to = reports_to
     employee.status = status
     
-    # Update Office (Replace existing allowed locations for simplicity based on current flow)
-    employee.allowed_locations = []
-    if office:
+    # Update Company if provided
+    if company:
+        employee.company = company
+    
+    # Update Office Locations - support both single office (backward compatibility) and multiple offices
+    if offices and isinstance(offices, list) and len(offices) > 0:
+        # Multiple offices provided
+        employee.allowed_locations = []
+        for office_name in offices:
+            if office_name:  # Skip empty values
+                employee.append("allowed_locations", {"office": office_name})
+    elif office:
+        # Single office provided (backward compatibility)
+        employee.allowed_locations = []
         employee.append("allowed_locations", {"office": office})
     
     # Update holiday_list if provided
@@ -1523,6 +1613,78 @@ def update_employee(employee_id, first_name, last_name, email, designation, repo
 
     frappe.db.commit()
     return employee.as_dict()
+
+
+@frappe.whitelist()
+def upload_profile_photo(content, filename, dt=None, dn=None, fieldname=None):
+    """
+    Upload a profile photo as a public file (is_private=0).
+    This is a wrapper around the standard file upload but ensures the file is public.
+    """
+    import base64
+    import io
+    from mimetypes import guess_type
+    
+    from PIL import Image, ImageOps
+    
+    from frappe.handler import ALLOWED_MIMETYPES
+    
+    decoded_content = base64.b64decode(content)
+    content_type = guess_type(filename)[0]
+    if content_type not in ALLOWED_MIMETYPES:
+        frappe.throw(_("You can only upload JPG, PNG, PDF, TXT or Microsoft documents."))
+    
+    if content_type.startswith("image/jpeg"):
+        # transpose the image according to the orientation tag, and remove the orientation data
+        with Image.open(io.BytesIO(decoded_content)) as image:
+            transpose_img = ImageOps.exif_transpose(image)
+            # convert the image back to bytes
+            file_content = io.BytesIO()
+            transpose_img.save(file_content, format="JPEG")
+            file_content = file_content.getvalue()
+    else:
+        file_content = decoded_content
+    
+    file_doc = frappe.get_doc(
+        {
+            "doctype": "File",
+            "attached_to_doctype": dt,
+            "attached_to_name": dn,
+            "attached_to_field": fieldname,
+            "folder": "Home",
+            "file_name": filename,
+            "content": file_content,
+            "is_private": 0,  # Set to public (not private)
+        }
+    ).insert()
+    
+    frappe.db.commit()
+    return file_doc
+
+
+@frappe.whitelist()
+def update_employee_profile_photo(image_url):
+    """
+    Update the current user's employee profile photo.
+    Only allows updating own profile photo.
+    
+    Args:
+        image_url: URL of the image (can be external URL like dicebear or file URL)
+    """
+    user = frappe.session.user
+    
+    # Get employee linked to this user
+    employee_id = frappe.db.get_value("Employee", {"user_id": user}, "name")
+    if not employee_id:
+        frappe.throw(_("No employee record found for current user"))
+    
+    # Update employee image
+    employee = frappe.get_doc("Employee", employee_id)
+    employee.image = image_url
+    employee.save(ignore_permissions=True)
+    
+    frappe.db.commit()
+    return {"success": True, "image_url": image_url}
 
 
 @frappe.whitelist()
