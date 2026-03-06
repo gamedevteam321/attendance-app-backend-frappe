@@ -30,14 +30,14 @@ DEFAULT_DESIGNATIONS = [
     "Assistant Machiner Operator",
     "Cluster Labour Supervisor",
     "Cluster - Accouting Executive",
-    # "Field Intern",
-    # "Helper",
+    "Field Intern",
+    "Helper",
     # Farm Office
     "Farm Support Assistant",
     "Farm Support Executive",
     "Farm - Accounting Supervisor",
-    # "Biologicals - Assistant",
-    # "Biologicals - Supervisor",
+    "Biologicals - Assistant",
+    "Biologicals - Supervisor",
     # Nursery Operations
     "Nursery Incharge",
     "Nursery Assistant",
@@ -46,22 +46,22 @@ DEFAULT_DESIGNATIONS = [
     "Head - Nursery Management",
     "Assistant - Nursery Management",
     # # Scientific Support
-    # "Head - Research & Scientific",
-    # "Head - Biologicals",
-    # "Assistance - Biologicals",
-    # "Sr Entomologist",
-    # "Entomologist",
-    # "Assistant Entomologist",
-    # "Sr Pathologist",
-    # "Pathologist",
-    # "Assistant - Pathologist",
-    # "Sr Agronomist",
-    # "Agronomist",
-    # "Assistant - Agronomist",
-    # "Research Executive",
-    # "Research Intern",
-    # "Lab Technician",
-    # "Lab - Assistant",
+    "Head - Research & Scientific",
+    "Head - Biologicals",
+    "Assistance - Biologicals",
+    "Sr Entomologist",
+    "Entomologist",
+    "Assistant Entomologist",
+    "Sr Pathologist",
+    "Pathologist",
+    "Assistant - Pathologist",
+    "Sr Agronomist",
+    "Agronomist",
+    "Assistant - Agronomist",
+    "Research Executive",
+    "Research Intern",
+    "Lab Technician",
+    "Lab - Assistant",
     # Equipment Management
     "Head - Equipment Management",
     "Equipment - Assistant",
@@ -73,10 +73,10 @@ DEFAULT_DESIGNATIONS = [
     "Accounts Supervisor",
     "Accounts Executive",
     # # Healing Team
-    # "Head - Healing",
-    # "Sr Healer",
-    # "Healer",
-    # "Healing Assistant",
+    "Head - Healing",
+    "Sr Healer",
+    "Healer",
+    "Healing Assistant",
 ]
 
 
@@ -90,6 +90,14 @@ def after_migrate():
                 "options": "Employee Office Location",
                 "insert_after": "default_shift",
                 "description": "Restrict attendance punch-in to these specific locations. If empty, allowed from anywhere (if no other restrictions apply)."
+            },
+            {
+                "fieldname": "allowed_geo_areas",
+                "label": "Allowed Geo Areas",
+                "fieldtype": "Table",
+                "options": "Employee Allowed Geo Area",
+                "insert_after": "allowed_locations",
+                "description": "Farm land (Geo Fencing Area) fields where this employee can mark attendance. Only Field-level areas are used for punch check."
             }
         ],
         "Leave Application": [
@@ -100,6 +108,16 @@ def after_migrate():
                 "options": "First Half\nSecond Half",
                 "insert_after": "half_day_date",
                 "description": "First half or second half of the day when leave type is Half Day.",
+            }
+        ],
+        "Attendance Log": [
+            {
+                "fieldname": "geo_fencing_area",
+                "label": "Geo Fencing Area",
+                "fieldtype": "Link",
+                "options": "Geo Fencing Area",
+                "insert_after": "office_location",
+                "description": "Farm field where punch was recorded when location_type is Farm.",
             }
         ]
     })

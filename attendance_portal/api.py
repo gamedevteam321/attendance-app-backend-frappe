@@ -11,6 +11,8 @@ from frappe.model.rename_doc import rename_doc
 from datetime import datetime
 import math
 
+from .geo_utils import distance_meters, is_point_in_polygon
+
 
 @frappe.whitelist(allow_guest=True)
 def get_current_profile():
@@ -87,60 +89,158 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     return c * r
 
 
+def _geo_fencing_area_exists():
+    return frappe.db.exists("DocType", "Geo Fencing Area")
+
+
+@frappe.whitelist()
+def get_geo_fencing_hierarchy():
+    """
+    Return Farm -> Cluster -> Field tree for the frontend.
+    If Geo Fencing Area doctype does not exist, return { "farms": [] }.
+    """
+    if not _geo_fencing_area_exists():
+        return {"farms": []}
+    type_names = ["Farm", "Cluster", "Field", "Block"]
+    areas = frappe.get_all(
+        "Geo Fencing Area",
+        filters={"geo_fencing_type": ["in", type_names]},
+        fields=["name", "area_name", "geo_fencing_type", "parent_area"],
+        order_by="area_name",
+    )
+    by_name = {a["name"]: a for a in areas}
+    for a in areas:
+        a.setdefault("clusters", [])
+        a.setdefault("fields", [])
+        a.setdefault("blocks", [])
+    roots = []
+    for a in areas:
+        parent_name = a.get("parent_area")
+        if not parent_name or parent_name not in by_name:
+            if a["geo_fencing_type"] == "Farm":
+                roots.append(a)
+        else:
+            parent = by_name[parent_name]
+            if a["geo_fencing_type"] == "Cluster":
+                parent.setdefault("clusters", []).append(a)
+            elif a["geo_fencing_type"] == "Block":
+                parent.setdefault("blocks", []).append(a)
+            elif a["geo_fencing_type"] == "Field":
+                parent.setdefault("fields", []).append(a)
+    farms = []
+    for r in roots:
+        def cluster_fields(c):
+            direct = c.get("fields", [])
+            from_blocks = []
+            for b in c.get("blocks", []):
+                from_blocks.extend(b.get("fields", []))
+            return direct + from_blocks
+        farms.append({
+            "name": r["name"],
+            "area_name": r.get("area_name") or r["name"],
+            "clusters": [
+                {
+                    "name": c["name"],
+                    "area_name": c.get("area_name") or c["name"],
+                    "fields": [
+                        {"name": f["name"], "area_name": f.get("area_name") or f["name"]}
+                        for f in cluster_fields(c)
+                    ],
+                }
+                for c in r.get("clusters", [])
+            ],
+        })
+    return {"farms": farms}
+
+
+@frappe.whitelist()
+def is_inside_geo_area(area_name, lat, lng):
+    """
+    Check if (lat, lng) is inside the given Geo Fencing Area (circle or polygon).
+    Returns { "inside": bool, "area_name": str }.
+    """
+    if not _geo_fencing_area_exists() or not area_name:
+        return {"inside": False, "area_name": area_name or ""}
+    lat = float(lat)
+    lng = float(lng)
+    try:
+        area = frappe.get_doc("Geo Fencing Area", area_name)
+    except Exception:
+        return {"inside": False, "area_name": area_name}
+    display_name = area.get("area_name") or area_name
+    if area.shape_type == "Circle":
+        if area.get("center_latitude") is not None and area.get("center_longitude") is not None and area.get("radius") is not None:
+            dist = distance_meters(lat, lng, float(area.center_latitude), float(area.center_longitude))
+            if dist <= float(area.radius):
+                return {"inside": True, "area_name": display_name}
+        return {"inside": False, "area_name": display_name}
+    if area.shape_type == "Polygon" and getattr(area, "geo_fencing_coordinates", None) and len(area.geo_fencing_coordinates) >= 3:
+        coords = sorted(area.geo_fencing_coordinates, key=lambda x: (x.sequence or 0))
+        polygon = [(float(c.latitude), float(c.longitude)) for c in coords]
+        if is_point_in_polygon(lat, lng, polygon):
+            return {"inside": True, "area_name": display_name}
+    return {"inside": False, "area_name": display_name}
+
+
 @frappe.whitelist()
 def is_inside_office(employee, lat, lng):
     """
-    Check if coordinates are within any allowed office location
-    
-    Args:
-        employee: Employee ID
-        lat: Latitude
-        lng: Longitude
-    
-    Returns:
-        dict: {
-            inside: bool,
-            office: str | None,
-            distance: float | None
-        }
+    Check if coordinates are within any allowed location (office or farm field).
+    First checks corporate offices, then allowed geo (farm) fields.
+    Returns dict with inside, office, distance, and when inside a farm: location_type="Farm", geo_fencing_area=...
     """
     lat = float(lat)
     lng = float(lng)
-    
-    # Get allowed office locations for employee
     employee_doc = frappe.get_doc("Employee", employee)
-    
-    if not employee_doc.allowed_locations:
+
+    # 1) Corporate offices
+    if getattr(employee_doc, "allowed_locations", None):
+        for location_row in employee_doc.allowed_locations:
+            office = frappe.get_doc("Office Location", location_row.office)
+            if not office.is_active:
+                continue
+            distance = haversine_distance(lat, lng, office.latitude, office.longitude)
+            if distance <= office.radius_meters:
+                return {
+                    "inside": True,
+                    "office": office.name,
+                    "office_name": office.office_name,
+                    "distance": round(distance, 2),
+                    "location_type": "Office",
+                    "geo_fencing_area": None,
+                }
+    elif not getattr(employee_doc, "allowed_geo_areas", None) or len(employee_doc.allowed_geo_areas) == 0:
         return {
             "inside": True,
             "office": "Anywhere",
             "distance": 0,
-            "message": "No office locations assigned - allowing from anywhere"
+            "message": "No office locations assigned - allowing from anywhere",
+            "location_type": "Office",
+            "geo_fencing_area": None,
         }
-    
-    # Check each allowed office location
-    for location_row in employee_doc.allowed_locations:
-        office = frappe.get_doc("Office Location", location_row.office)
-        
-        if not office.is_active:
-            continue
-        
-        # Calculate distance
-        distance = haversine_distance(lat, lng, office.latitude, office.longitude)
-        
-        # Check if within radius
-        if distance <= office.radius_meters:
-            return {
-                "inside": True,
-                "office": office.name,
-                "office_name": office.office_name,
-                "distance": round(distance, 2)
-            }
-    
+
+    # 2) Farm fields (allowed_geo_areas)
+    if _geo_fencing_area_exists() and getattr(employee_doc, "allowed_geo_areas", None):
+        for row in employee_doc.allowed_geo_areas:
+            area_name = getattr(row, "geo_fencing_area", None)
+            if not area_name:
+                continue
+            result = is_inside_geo_area(area_name, lat, lng)
+            if result.get("inside"):
+                return {
+                    "inside": True,
+                    "office": None,
+                    "distance": None,
+                    "location_type": "Farm",
+                    "geo_fencing_area": area_name,
+                    "area_name": result.get("area_name", area_name),
+                }
     return {
         "inside": False,
         "office": None,
-        "distance": None
+        "distance": None,
+        "location_type": None,
+        "geo_fencing_area": None,
     }
 
 
@@ -228,33 +328,28 @@ def mark_punch(employee, lat, lng, action):
     
     location_type = None
     office_location = None
+    geo_fencing_area = None
     remote_req = None
     remote_status = None
-    
+
     if remote_check["has_remote"]:
-        # User has remote work request (pending or approved)
         remote_req = remote_check["request_name"]
         remote_status = remote_check["request_status"]
         location_type = "Remote"
-        
-        # For remote work, allow punch IN and OUT from anywhere
-        # Still check if they happen to be in office for record keeping
         office_check = is_inside_office(employee, lat, lng)
         if office_check["inside"]:
-            office_location = office_check["office"]
+            office_location = office_check.get("office")
+            geo_fencing_area = office_check.get("geo_fencing_area")
     else:
-        # No remote request - must follow office location rules
         office_check = is_inside_office(employee, lat, lng)
-        
         if not office_check["inside"]:
             if action == "IN":
-                frappe.throw(_("You are not within any allowed office location. Please request remote work if working remotely."))
+                frappe.throw(_("You are not within any allowed office or farm location. Please request remote work if working remotely."))
             else:
-                # For OUT action, throw error - user should use request_punch_out_outside_office API instead
-                frappe.throw(_("You must be within an office location to punch out when not working remotely. Please use the punch out outside office feature."))
-        
-        location_type = "Office"
-        office_location = office_check["office"]
+                frappe.throw(_("You must be within an office or farm location to punch out when not working remotely. Please use the punch out outside office feature."))
+        location_type = office_check.get("location_type") or "Office"
+        office_location = office_check.get("office")
+        geo_fencing_area = office_check.get("geo_fencing_area")
 
     if action == "IN":
         # Check if there's already an attendance log for TODAY (regardless of check_out status)
@@ -295,6 +390,8 @@ def mark_punch(employee, lat, lng, action):
                         attendance_log.check_in_lng = lng
                         attendance_log.location_type = location_type
                         attendance_log.office_location = office_location
+                        if hasattr(attendance_log, "geo_fencing_area"):
+                            attendance_log.geo_fencing_area = geo_fencing_area
                         attendance_log.working_remote_req = remote_req
                         attendance_log.status = "Pending Approval"
                     else:
@@ -310,8 +407,10 @@ def mark_punch(employee, lat, lng, action):
                     attendance_log.check_in_lng = lng
                     attendance_log.location_type = location_type
                     attendance_log.office_location = office_location
+                    if hasattr(attendance_log, "geo_fencing_area"):
+                        attendance_log.geo_fencing_area = geo_fencing_area
                     attendance_log.working_remote_req = remote_req
-                    
+
                     # Set status based on remote request approval status
                     if remote_status == "Pending":
                         attendance_log.status = "Pending Approval"
@@ -335,6 +434,8 @@ def mark_punch(employee, lat, lng, action):
                 attendance_log.check_in_lng = lng
                 attendance_log.location_type = location_type
                 attendance_log.office_location = office_location
+                if hasattr(attendance_log, "geo_fencing_area"):
+                    attendance_log.geo_fencing_area = geo_fencing_area
                 attendance_log.working_remote_req = remote_req
                 if remote_status == "Pending":
                     attendance_log.status = "Pending Approval"
@@ -343,8 +444,7 @@ def mark_punch(employee, lat, lng, action):
                 else:
                     attendance_log.status = "Present"
             else:
-                # Create new attendance log
-                attendance_log = frappe.get_doc({
+                log_dict = {
                     "doctype": "Attendance Log",
                     "employee": employee,
                     "attendance_date": attendance_date,
@@ -354,8 +454,11 @@ def mark_punch(employee, lat, lng, action):
                     "check_in_lat": lat,
                     "check_in_lng": lng,
                     "working_remote_req": remote_req,
-                    "status": "Pending Approval" if remote_status == "Pending" else "Present"
-                })
+                    "status": "Pending Approval" if remote_status == "Pending" else "Present",
+                }
+                if geo_fencing_area:
+                    log_dict["geo_fencing_area"] = geo_fencing_area
+                attendance_log = frappe.get_doc(log_dict)
             
     elif action == "OUT":
         # Find today's attendance log with check_in but no check_out
@@ -378,10 +481,11 @@ def mark_punch(employee, lat, lng, action):
         attendance_log.check_out_lat = lat
         attendance_log.check_out_lng = lng
         
-        # Update office_location if available (for remote workers who punch out from office)
         if office_location:
             attendance_log.office_location = office_location
-        
+        if geo_fencing_area and hasattr(attendance_log, "geo_fencing_area"):
+            attendance_log.geo_fencing_area = geo_fencing_area
+
         # Only update status if remote request is approved
         # If pending, keep as "Pending Approval" - will be updated when manager approves
         if attendance_log.status != "Pending Approval":
@@ -1486,7 +1590,7 @@ def get_employee_requests(doctype):
 
 
 @frappe.whitelist()
-def create_employee(first_name, last_name, email, password, designation, gender, date_of_birth, date_of_joining, company, reports_to, office=None, offices=None, roles=None, holiday_list=None):
+def create_employee(first_name, last_name, email, password, designation, gender, date_of_birth, date_of_joining, company, reports_to, office=None, offices=None, allowed_farm_fields=None, roles=None, holiday_list=None):
     """
     Create a new User and Employee document.
     
@@ -1537,17 +1641,31 @@ def create_employee(first_name, last_name, email, password, designation, gender,
     user.insert(ignore_permissions=True)
     
     # 2. Create Employee
-    # Handle office locations - support both single office (backward compatibility) and multiple offices
     allowed_locations = []
     if offices and isinstance(offices, list) and len(offices) > 0:
-        # Multiple offices provided
         for office_name in offices:
-            if office_name:  # Skip empty values
+            if office_name:
                 allowed_locations.append({"office": office_name})
     elif office:
-        # Single office provided (backward compatibility)
         allowed_locations.append({"office": office})
-    
+
+    allowed_geo_areas = []
+    if _geo_fencing_area_exists() and allowed_farm_fields and isinstance(allowed_farm_fields, list):
+        for area_name in allowed_farm_fields:
+            if area_name and isinstance(area_name, str) and frappe.db.exists("Geo Fencing Area", area_name):
+                allowed_geo_areas.append({"geo_fencing_area": area_name})
+    if isinstance(allowed_farm_fields, str) and allowed_farm_fields.strip():
+        try:
+            parsed = json.loads(allowed_farm_fields)
+            if isinstance(parsed, list):
+                for area_name in parsed:
+                    if area_name and frappe.db.exists("Geo Fencing Area", area_name):
+                        allowed_geo_areas.append({"geo_fencing_area": area_name})
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    if not allowed_locations and not allowed_geo_areas:
+        frappe.throw(_("At least one work location is required: assign at least one corporate office or at least one farm field."))
     employee = frappe.get_doc({
         "doctype": "Employee",
         "first_name": first_name,
@@ -1562,6 +1680,10 @@ def create_employee(first_name, last_name, email, password, designation, gender,
         "status": "Active",
         "allowed_locations": allowed_locations
     })
+    if getattr(employee, "allowed_geo_areas", None) is not None and allowed_geo_areas:
+        employee.allowed_geo_areas = []
+        for row in allowed_geo_areas:
+            employee.append("allowed_geo_areas", row)
     
     # Set holiday_list if provided
     if holiday_list:
@@ -1591,7 +1713,7 @@ def create_employee(first_name, last_name, email, password, designation, gender,
 
 
 @frappe.whitelist()
-def update_employee(employee_id, first_name, last_name, email, designation, reports_to, status, office=None, offices=None, company=None, password=None, holiday_list=None):
+def update_employee(employee_id, first_name, last_name, email, designation, reports_to, status, office=None, offices=None, allowed_farm_fields=None, company=None, password=None, holiday_list=None):
     """
     Update Employee and User details.
     
@@ -1632,11 +1754,33 @@ def update_employee(employee_id, first_name, last_name, email, designation, repo
                     if frappe.db.exists("Office Location", office_name):
                         employee.append("allowed_locations", {"office": office_name})
         elif office:
-            # Single office provided (backward compatibility)
             employee.allowed_locations = []
             if frappe.db.exists("Office Location", office):
                 employee.append("allowed_locations", {"office": office})
-    
+
+    # Update farm fields (allowed_geo_areas) only if the custom field exists on Employee
+    if _geo_fencing_area_exists() and frappe.get_meta("Employee").has_field("allowed_geo_areas"):
+        if isinstance(allowed_farm_fields, str):
+            try:
+                allowed_farm_fields = json.loads(allowed_farm_fields) if (allowed_farm_fields or "").strip() else []
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                allowed_farm_fields = []
+        if allowed_farm_fields is not None and isinstance(allowed_farm_fields, list):
+            # Normalize: accept string or dict with name/geo_fencing_area
+            area_names = []
+            for item in allowed_farm_fields:
+                if isinstance(item, str) and item.strip():
+                    area_names.append(item.strip())
+                elif isinstance(item, dict):
+                    name = item.get("name") or item.get("geo_fencing_area")
+                    if name:
+                        area_names.append(str(name).strip())
+            # Clear and set only valid Geo Fencing Area names
+            employee.allowed_geo_areas = []
+            for area_name in area_names:
+                if frappe.db.exists("Geo Fencing Area", area_name):
+                    employee.append("allowed_geo_areas", {"geo_fencing_area": area_name})
+
     # Update holiday_list if provided
     if holiday_list is not None:
         if holiday_list:  # If not empty string
@@ -1646,23 +1790,33 @@ def update_employee(employee_id, first_name, last_name, email, designation, repo
             employee.holiday_list = holiday_list
         else:  # Empty string means clear the holiday_list
             employee.holiday_list = None
-        
-    employee.save(ignore_permissions=True)
-    
+
+    try:
+        employee.save(ignore_permissions=True)
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Attendance Portal update_employee (save)")
+        raise
+
     # 2. Update User
     if employee.user_id:
         user = frappe.get_doc("User", employee.user_id)
         user.first_name = first_name
         user.last_name = last_name
-        user.email = email
-        
+        # Skip updating email for Administrator (system user may not use email format)
+        if employee.user_id != "Administrator":
+            user.email = email
+
         if password:
             user.new_password = password
-            
-        user.save(ignore_permissions=True)
-        
-        # If email changed, update user_id in Employee
-        if email != employee.user_id:
+
+        try:
+            user.save(ignore_permissions=True)
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "Attendance Portal update_employee (user save)")
+            raise
+
+        # If email changed, update user_id in Employee (never rename Administrator)
+        if employee.user_id != "Administrator" and email != employee.user_id:
             rename_doc("User", employee.user_id, email, ignore_permissions=True)
             employee.user_id = email
             employee.save(ignore_permissions=True)
@@ -1887,13 +2041,14 @@ def get_employee_stats(employee, from_date, to_date):
         if linked_employee != employee:
             frappe.throw(_("Not authorized"))
 
+    log_fields = ["name", "attendance_date", "check_in", "check_out", "status", "working_hours", "location_type", "office_location", "geo_fencing_area"]
     logs = frappe.get_all(
         "Attendance Log",
         filters={
             "employee": employee,
             "attendance_date": ["between", [from_date, to_date]]
         },
-        fields=["name", "attendance_date", "check_in", "check_out", "status", "working_hours", "location_type", "office_location"],
+        fields=log_fields,
         order_by="attendance_date desc"
     )
 

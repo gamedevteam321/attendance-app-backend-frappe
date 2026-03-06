@@ -128,11 +128,14 @@ after_migrate = "attendance_portal.setup.after_migrate"
 
 # DocType Class
 # ---------------
-# Override standard doctype classes
-
-# override_doctype_class = {
-# 	"ToDo": "custom_app.overrides.CustomToDo"
-# }
+# Override standard doctype classes.
+# Employee Allowed Geo Area is a child table in this app; ensure Frappe loads its controller from here
+# (avoids "No module named 'frappe.core.doctype.employee_allowed_geo_area'" when used on Employee).
+override_doctype_class = {
+	"Employee Allowed Geo Area": [
+		"attendance_portal.attendance_portal.doctype.employee_allowed_geo_area.employee_allowed_geo_area.EmployeeAllowedGeoArea"
+	],
+}
 
 # Document Events
 # ---------------

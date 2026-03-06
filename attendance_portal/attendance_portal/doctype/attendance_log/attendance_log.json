@@ -67,7 +67,7 @@
             "fieldtype": "Select",
             "in_list_view": 1,
             "label": "Location Type",
-            "options": "Office\nRemote"
+            "options": "Office\nRemote\nFarm"
         },
         {
             "fieldname": "office_location",

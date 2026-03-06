@@ -1,0 +1,29 @@
+{
+    "actions": [],
+    "creation": "2025-03-06 12:00:00.000000",
+    "doctype": "DocType",
+    "engine": "InnoDB",
+    "field_order": ["geo_fencing_area"],
+    "fields": [
+        {
+            "fieldname": "geo_fencing_area",
+            "fieldtype": "Link",
+            "in_list_view": 1,
+            "label": "Geo Fencing Area",
+            "options": "Geo Fencing Area",
+            "reqd": 1
+        }
+    ],
+    "index_web_pages_for_search": 0,
+    "istable": 1,
+    "links": [],
+    "modified": "2025-03-06 12:00:00.000000",
+    "modified_by": "Administrator",
+    "module": "Attendance Portal",
+    "name": "Employee Allowed Geo Area",
+    "owner": "Administrator",
+    "permissions": [],
+    "sort_field": "modified",
+    "sort_order": "DESC",
+    "states": []
+}
