@@ -1,0 +1,58 @@
+{
+    "actions": [],
+    "creation": "2025-03-05 12:00:00.000000",
+    "doctype": "DocType",
+    "engine": "InnoDB",
+    "field_order": [
+        "leave_settings_section",
+        "monthly_casual_leaves",
+        "monthly_sick_leaves"
+    ],
+    "fields": [
+        {
+            "fieldname": "leave_settings_section",
+            "fieldtype": "Section Break",
+            "label": "Monthly Leave Allocation"
+        },
+        {
+            "default": "1",
+            "description": "Leaves added per active employee at the start of each month. Can be a decimal (e.g. 1.5).",
+            "fieldname": "monthly_casual_leaves",
+            "fieldtype": "Float",
+            "label": "Monthly Casual Leaves",
+            "precision": "3"
+        },
+        {
+            "default": "1",
+            "description": "Leaves added per active employee at the start of each month. Can be a decimal (e.g. 1.5).",
+            "fieldname": "monthly_sick_leaves",
+            "fieldtype": "Float",
+            "label": "Monthly Sick Leaves",
+            "precision": "3"
+        }
+    ],
+    "icon": "fa fa-cog",
+    "issingle": 1,
+    "links": [],
+    "modified": "2025-03-05 12:00:00.000000",
+    "modified_by": "Administrator",
+    "module": "Attendance Portal",
+    "name": "Attendance Portal Settings",
+    "owner": "Administrator",
+    "permissions": [
+        {
+            "create": 1,
+            "read": 1,
+            "role": "HR Admin",
+            "write": 1
+        },
+        {
+            "read": 1,
+            "role": "System Manager"
+        }
+    ],
+    "sort_field": "modified",
+    "sort_order": "DESC",
+    "states": [],
+    "track_changes": 1
+}

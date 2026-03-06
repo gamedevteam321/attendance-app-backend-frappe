@@ -3,6 +3,7 @@ API methods for Attendance Portal
 All methods are whitelisted for frontend access via frappe-react-sdk
 """
 
+import json
 import frappe
 from frappe import _
 from frappe.utils import today, now_datetime, get_datetime
@@ -602,7 +603,7 @@ def create_remote_request(employee, from_date, to_date, reason, lat=None, lng=No
 
 
 @frappe.whitelist()
-def apply_for_leave(employee, leave_type, from_date, to_date, reason):
+def apply_for_leave(employee, leave_type, from_date, to_date, reason, half_day_slot=None):
     """
     Create leave application with validation based on leave type.
     
@@ -610,13 +611,15 @@ def apply_for_leave(employee, leave_type, from_date, to_date, reason):
     - Casual Leave: Cannot apply if balance <= 0
     - Sick Leave: Can apply even if balance <= 0 (can go negative)
     - Compensatory Leave: No balance check (no deduction)
+    - Half Day: Single day only; requires half_day_slot "First Half" or "Second Half"
     
     Args:
         employee: Employee ID
-        leave_type: Leave Type
+        leave_type: Leave Type (e.g. Casual Leave, Sick Leave, Half Day)
         from_date: Start date
         to_date: End date
         reason: Reason for leave
+        half_day_slot: "First Half" or "Second Half" when leave_type is "Half Day"
     
     Returns:
         dict: Leave Application document
@@ -631,6 +634,13 @@ def apply_for_leave(employee, leave_type, from_date, to_date, reason):
     if employee_user and employee_user != current_user and not is_hr_admin:
         frappe.throw(_("You can only apply for leave for yourself"))
     
+    # Half Day leave type: single day only, require first/second half
+    if leave_type == "Half Day":
+        if from_date != to_date:
+            frappe.throw(_("Half Day leave must be for a single day. Set From Date and To Date to the same date."))
+        if half_day_slot not in ("First Half", "Second Half"):
+            frappe.throw(_("Please select First Half or Second Half for Half Day leave."))
+    
     # Validate leave balance for Casual Leave
     if leave_type == "Casual Leave":
         balances = get_leave_balances(employee)
@@ -639,8 +649,7 @@ def apply_for_leave(employee, leave_type, from_date, to_date, reason):
         if casual_balance and casual_balance["remaining"] <= 0:
             frappe.throw(_("Insufficient Casual Leave balance. You have {0} leaves remaining.").format(casual_balance['remaining']))
     
-    # Create leave application
-    leave_application = frappe.get_doc({
+    doc_dict = {
         "doctype": "Leave Application",
         "employee": employee,
         "leave_type": leave_type,
@@ -649,9 +658,17 @@ def apply_for_leave(employee, leave_type, from_date, to_date, reason):
         "description": reason,
         "status": "Open",
         "docstatus": 0,
-        "posting_date": today()
-    })
+        "posting_date": today(),
+    }
     
+    if leave_type == "Half Day":
+        doc_dict["half_day"] = 1
+        doc_dict["half_day_date"] = from_date
+        doc_dict["half_day_slot"] = half_day_slot
+    else:
+        doc_dict["half_day"] = 0
+    
+    leave_application = frappe.get_doc(doc_dict)
     leave_application.insert(ignore_permissions=True)
     frappe.db.commit()
     
@@ -681,7 +698,7 @@ def get_leave_balances(employee):
     year_start = f"{current_year}-01-01"
     year_end = f"{current_year}-12-31"
     
-    leave_types = ["Casual Leave", "Sick Leave", "Compensatory Leave"]
+    leave_types = ["Casual Leave", "Sick Leave", "Compensatory Leave", "Half Day"]
     balances = []
     
     for leave_type in leave_types:
@@ -1031,6 +1048,15 @@ def get_attendance_logs(employee, date=None):
 
 
 @frappe.whitelist()
+def get_google_maps_api_key():
+    """
+    Return the Google Maps API key from site config (site_config.json key: google_maps_api_key).
+    Used by the frontend for Work Locations map, search, and satellite view.
+    """
+    return frappe.conf.get("google_maps_api_key") or ""
+
+
+@frappe.whitelist()
 def get_office_locations():
     """
     Get all office locations
@@ -1055,6 +1081,28 @@ def get_office_locations():
     
     
     return locations
+
+
+@frappe.whitelist()
+def create_designation(designation_name, description=None):
+    """
+    Create a new Designation. Allowed for HR Admin so they can add designations from the employee form.
+    """
+    if "HR Admin" not in frappe.get_roles(frappe.session.user) and "System Manager" not in frappe.get_roles(frappe.session.user):
+        frappe.throw(_("Not authorized to create designations"))
+    designation_name = (designation_name or "").strip()
+    if not designation_name:
+        frappe.throw(_("Designation name is required"))
+    if frappe.db.exists("Designation", designation_name):
+        return designation_name
+    doc = frappe.get_doc({
+        "doctype": "Designation",
+        "designation_name": designation_name,
+        "description": description or "",
+    })
+    doc.insert(ignore_permissions=True)
+    frappe.db.commit()
+    return doc.name
 
 
 @frappe.whitelist()
@@ -1570,16 +1618,24 @@ def update_employee(employee_id, first_name, last_name, email, designation, repo
         employee.company = company
     
     # Update Office Locations - support both single office (backward compatibility) and multiple offices
-    if offices and isinstance(offices, list) and len(offices) > 0:
-        # Multiple offices provided
-        employee.allowed_locations = []
-        for office_name in offices:
-            if office_name:  # Skip empty values
-                employee.append("allowed_locations", {"office": office_name})
-    elif office:
-        # Single office provided (backward compatibility)
-        employee.allowed_locations = []
-        employee.append("allowed_locations", {"office": office})
+    if getattr(employee, "allowed_locations", None) is not None:
+        # Parse offices if sent as JSON string (e.g. from some API clients)
+        if isinstance(offices, str):
+            try:
+                offices = json.loads(offices) if offices.strip() else []
+            except (json.JSONDecodeError, AttributeError):
+                offices = []
+        if offices is not None and isinstance(offices, list):
+            employee.allowed_locations = []
+            for office_name in offices:
+                if office_name and isinstance(office_name, str):
+                    if frappe.db.exists("Office Location", office_name):
+                        employee.append("allowed_locations", {"office": office_name})
+        elif office:
+            # Single office provided (backward compatibility)
+            employee.allowed_locations = []
+            if frappe.db.exists("Office Location", office):
+                employee.append("allowed_locations", {"office": office})
     
     # Update holiday_list if provided
     if holiday_list is not None:
@@ -1613,6 +1669,135 @@ def update_employee(employee_id, first_name, last_name, email, designation, repo
 
     frappe.db.commit()
     return employee.as_dict()
+
+
+@frappe.whitelist()
+def create_sample_data():
+    """
+    Create sample users and employees for testing the attendance portal.
+    Requires System Manager or HR Admin. Uses default password Sample@123 for all.
+    Creates: 1 HR Admin, 1 Manager, 2 Employees; ensures a Company and Work Location exist.
+    """
+    roles = frappe.get_roles(frappe.session.user)
+    if "System Manager" not in roles and "HR Admin" not in roles:
+        frappe.throw(_("Not authorized. Only System Manager or HR Admin can create sample data."))
+
+    company = _get_or_create_sample_company()
+    work_location = _get_or_create_sample_work_location(company)
+    default_password = "Sample@123"
+
+    samples = [
+        {
+            "email": "sample_hradmin@example.com",
+            "first_name": "Sample",
+            "last_name": "HR Admin",
+            "designation": "HR Manager",
+            "gender": "Female",
+            "roles": ["Employee", "HR Admin"],
+        },
+        {
+            "email": "sample_manager@example.com",
+            "first_name": "Sample",
+            "last_name": "Manager",
+            "designation": "Team Lead",
+            "gender": "Male",
+            "roles": ["Employee", "Manager"],
+        },
+        {
+            "email": "sample_employee1@example.com",
+            "first_name": "Rahul",
+            "last_name": "Sharma",
+            "designation": "Developer",
+            "gender": "Male",
+            "roles": ["Employee"],
+        },
+        {
+            "email": "sample_employee2@example.com",
+            "first_name": "Priya",
+            "last_name": "Singh",
+            "designation": "Designer",
+            "gender": "Female",
+            "roles": ["Employee"],
+        },
+    ]
+
+    created = []
+    manager_employee_id = None
+
+    for s in samples:
+        if frappe.db.exists("User", s["email"]):
+            created.append({"email": s["email"], "status": "already_exists"})
+            if "Manager" in s["roles"]:
+                manager_employee_id = frappe.db.get_value("Employee", {"user_id": s["email"]}, "name")
+            continue
+        try:
+            reports_to = manager_employee_id if ("Manager" not in s["roles"] and manager_employee_id) else None
+            emp = create_employee(
+                first_name=s["first_name"],
+                last_name=s["last_name"],
+                email=s["email"],
+                password=default_password,
+                designation=s["designation"],
+                gender=s["gender"],
+                date_of_birth="1990-01-15",
+                date_of_joining=today(),
+                company=company,
+                reports_to=reports_to,
+                offices=[work_location] if work_location else None,
+                roles=s["roles"],
+            )
+            if "Manager" in s["roles"]:
+                manager_employee_id = emp.get("name")
+            created.append({"email": s["email"], "status": "created", "employee": emp.get("name")})
+        except Exception as e:
+            created.append({"email": s["email"], "status": "error", "message": str(e)})
+
+    frappe.db.commit()
+    return {
+        "message": "Sample data created. Use password: Sample@123 for all sample users.",
+        "company": company,
+        "work_location": work_location,
+        "created": created,
+    }
+
+
+def _get_or_create_sample_company():
+    companies = frappe.get_all("Company", pluck="name")
+    if companies:
+        return companies[0]
+    doc = frappe.get_doc({
+        "doctype": "Company",
+        "company_name": "Sample Company",
+        "default_currency": "INR",
+        "abbr": "SC",
+    })
+    doc.insert(ignore_permissions=True)
+    frappe.db.commit()
+    return doc.name
+
+
+def _get_or_create_sample_work_location(company):
+    locations = frappe.get_all(
+        "Office Location",
+        filters={"company": company, "is_active": 1},
+        pluck="name",
+        limit=1,
+    )
+    if locations:
+        return locations[0]
+    doc = frappe.get_doc({
+        "doctype": "Office Location",
+        "office_name": "Sample Work Location",
+        "company": company,
+        "latitude": 28.6139,
+        "longitude": 77.209,
+        "radius_meters": 200,
+        "is_active": 1,
+        "address": "Sample Address, New Delhi",
+    })
+    doc.insert(ignore_permissions=True)
+    frappe.db.commit()
+    return doc.name
 
 
 @frappe.whitelist()
@@ -1708,9 +1893,49 @@ def get_employee_stats(employee, from_date, to_date):
             "employee": employee,
             "attendance_date": ["between", [from_date, to_date]]
         },
-        fields=["attendance_date", "check_in", "check_out", "status", "working_hours"],
+        fields=["name", "attendance_date", "check_in", "check_out", "status", "working_hours", "location_type", "office_location"],
         order_by="attendance_date desc"
     )
+
+    # Enrich with regularization and punch-out-of-office info
+    log_names = [log.name for log in logs]
+    reg_by_date = {}
+    if frappe.db.exists("DocType", "Attendance Regularization Request") and logs:
+        reg_list = frappe.get_all(
+            "Attendance Regularization Request",
+            filters={
+                "employee": employee,
+                "attendance_date": ["between", [from_date, to_date]],
+                "status": "Approved"
+            },
+            fields=["attendance_date", "reason", "requested_in", "requested_out", "status"]
+        )
+        for r in reg_list:
+            reg_by_date[str(r.attendance_date)] = {
+                "reason": r.reason,
+                "requested_in": r.requested_in,
+                "requested_out": r.requested_out,
+                "status": r.status,
+            }
+    punch_out_by_log = {}
+    if frappe.db.exists("DocType", "Punch Out Request") and log_names:
+        punch_list = frappe.get_all(
+            "Punch Out Request",
+            filters={"attendance_log": ["in", log_names]},
+            fields=["attendance_log", "reason", "status", "latitude", "longitude", "check_out_time"]
+        )
+        for p in punch_list:
+            punch_out_by_log[p.attendance_log] = {
+                "reason": p.reason,
+                "status": p.status,
+                "latitude": p.latitude,
+                "longitude": p.longitude,
+                "check_out_time": p.check_out_time,
+            }
+    for log in logs:
+        log["is_regularized"] = str(log.attendance_date) in reg_by_date
+        log["regularization"] = reg_by_date.get(str(log.attendance_date))
+        log["punch_out_request"] = punch_out_by_log.get(log.name)
     
     total_present = 0
     total_absent = 0
@@ -2141,6 +2366,14 @@ def setup_default_leave_types():
             "allow_negative": 0,
             "include_holiday": 0,
             "is_lwp": 0  # Not LWP, but special handling (no deduction)
+        },
+        {
+            "name": "Half Day",
+            "max_leaves_allowed": 0,
+            "is_carry_forward": 0,
+            "allow_negative": 1,
+            "include_holiday": 0,
+            "is_lwp": 0
         }
     ]
     
@@ -2165,33 +2398,75 @@ def setup_default_leave_types():
     }
 
 
+def _get_monthly_leave_values():
+    """Get monthly casual and sick leave values from Attendance Portal Settings. Defaults to 1 if not set."""
+    try:
+        settings = frappe.get_single("Attendance Portal Settings")
+        casual = float(settings.monthly_casual_leaves) if settings.monthly_casual_leaves is not None else 1
+        sick = float(settings.monthly_sick_leaves) if settings.monthly_sick_leaves is not None else 1
+        return casual, sick
+    except Exception:
+        return 1.0, 1.0
+
+
+@frappe.whitelist()
+def get_leave_settings():
+    """
+    Get monthly leave allocation settings. HR Admin only for write; anyone can read for display.
+    """
+    try:
+        settings = frappe.get_single("Attendance Portal Settings")
+        return {
+            "monthly_casual_leaves": float(settings.monthly_casual_leaves) if settings.monthly_casual_leaves is not None else 1,
+            "monthly_sick_leaves": float(settings.monthly_sick_leaves) if settings.monthly_sick_leaves is not None else 1,
+        }
+    except Exception:
+        return {"monthly_casual_leaves": 1, "monthly_sick_leaves": 1}
+
+
+@frappe.whitelist()
+def set_leave_settings(monthly_casual_leaves=None, monthly_sick_leaves=None):
+    """
+    Set monthly leave allocation values. HR Admin only.
+    Values can be decimals (e.g. 1.5).
+    """
+    if "HR Admin" not in frappe.get_roles(frappe.session.user):
+        frappe.throw(_("Not authorized to update leave settings"))
+    settings = frappe.get_single("Attendance Portal Settings")
+    if monthly_casual_leaves is not None:
+        settings.monthly_casual_leaves = float(monthly_casual_leaves)
+    if monthly_sick_leaves is not None:
+        settings.monthly_sick_leaves = float(monthly_sick_leaves)
+    settings.save(ignore_permissions=True)
+    frappe.db.commit()
+    return {"message": "Leave settings updated", "monthly_casual_leaves": settings.monthly_casual_leaves, "monthly_sick_leaves": settings.monthly_sick_leaves}
+
+
 @frappe.whitelist()
 def allocate_monthly_leaves():
     """
-    Allocate 1 Casual Leave and 1 Sick Leave to all active employees for the current month.
-    Should be run on the 1st of every month.
+    Allocate configured Casual and Sick leaves to all active employees for the current month.
+    Uses values from Attendance Portal Settings (default 1 each). Run on the 1st of every month.
     """
     from datetime import datetime
     import calendar
-    
-    # Get current month dates
+
+    monthly_casual, monthly_sick = _get_monthly_leave_values()
+    if monthly_casual <= 0 and monthly_sick <= 0:
+        return {"message": "Monthly casual and sick leave values are both 0; no allocations created."}
+
     now = datetime.now()
     year = now.year
     month = now.month
-    
-    # First and last day of current month
     _, last_day = calendar.monthrange(year, month)
     from_date = f"{year}-{month:02d}-01"
     to_date = f"{year}-{month:02d}-{last_day}"
-    
-    # Get all active employees
+
     employees = frappe.get_all("Employee", filters={"status": "Active"}, fields=["name", "employee_name"])
-    
     allocations_created = 0
-    
+
     for emp in employees:
-        # 1. Allocate Casual Leave
-        if not frappe.db.exists("Leave Allocation", {
+        if monthly_casual > 0 and not frappe.db.exists("Leave Allocation", {
             "employee": emp.name,
             "leave_type": "Casual Leave",
             "from_date": from_date,
@@ -2204,15 +2479,14 @@ def allocate_monthly_leaves():
                 "leave_type": "Casual Leave",
                 "from_date": from_date,
                 "to_date": to_date,
-                "new_leaves_allocated": 1,
-                "total_leaves_allocated": 0, # Explicitly 0 to avoid double counting
-                "docstatus": 1 # Submit immediately
+                "new_leaves_allocated": monthly_casual,
+                "total_leaves_allocated": 0,
+                "docstatus": 1
             })
             doc.insert(ignore_permissions=True)
             allocations_created += 1
-            
-        # 2. Allocate Sick Leave
-        if not frappe.db.exists("Leave Allocation", {
+
+        if monthly_sick > 0 and not frappe.db.exists("Leave Allocation", {
             "employee": emp.name,
             "leave_type": "Sick Leave",
             "from_date": from_date,
@@ -2225,13 +2499,13 @@ def allocate_monthly_leaves():
                 "leave_type": "Sick Leave",
                 "from_date": from_date,
                 "to_date": to_date,
-                "new_leaves_allocated": 1,
-                "total_leaves_allocated": 0, # Explicitly 0 to avoid double counting
-                "docstatus": 1 # Submit immediately
+                "new_leaves_allocated": monthly_sick,
+                "total_leaves_allocated": 0,
+                "docstatus": 1
             })
             doc.insert(ignore_permissions=True)
             allocations_created += 1
-            
+
     frappe.db.commit()
     return {"message": f"Allocated leaves for {len(employees)} employees. Total allocations: {allocations_created}"}
 

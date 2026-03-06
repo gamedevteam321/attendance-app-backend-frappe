@@ -148,24 +148,12 @@ after_migrate = "attendance_portal.setup.after_migrate"
 
 # Scheduled Tasks
 # ---------------
-
-# scheduler_events = {
-# 	"all": [
-# 		"attendance_portal.tasks.all"
-# 	],
-# 	"daily": [
-# 		"attendance_portal.tasks.daily"
-# 	],
-# 	"hourly": [
-# 		"attendance_portal.tasks.hourly"
-# 	],
-# 	"weekly": [
-# 		"attendance_portal.tasks.weekly"
-# 	],
-# 	"monthly": [
-# 		"attendance_portal.tasks.monthly"
-# 	],
-# }
+# Runs on 1st of every month to auto-allocate casual and sick leaves from Attendance Portal Settings.
+scheduler_events = {
+	"monthly": [
+		"attendance_portal.tasks.monthly"
+	],
+}
 
 # Testing
 # -------
