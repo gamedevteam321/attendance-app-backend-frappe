@@ -98,9 +98,10 @@ def after_migrate():
                 "options": "Employee Allowed Geo Area",
                 "insert_after": "allowed_locations",
                 "description": (
-                    "Field Supervisor: use Add Row to assign one or more Field-level Geo Fencing Areas (each row is a root). "
-                    "Cluster Supervisor / Driver: use Add Row to assign one or more Cluster-level Geo Fencing Areas (each row is a root). "
-                    "Farm Manager: assign Farm, Cluster, or Field level areas (each row is a root). "
+                    "Highest role wins: Project Manager > Farm Manager > Cluster Supervisor / Driver > Field Supervisor. "
+                    "Project Manager and Farm Manager: assign Farm, Cluster, or Field level Geo Fencing Areas (each row is a root). "
+                    "Cluster Supervisor / Driver: Cluster or Field level areas. "
+                    "Field Supervisor: Field-level areas only. "
                     "Sub-areas inherit access. Only System Manager, Administrator, or Project Manager may edit this table for users with those scoped roles. "
                     "For attendance punch-in on farm land, Field-level areas are used where applicable."
                 ),

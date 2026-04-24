@@ -12,6 +12,7 @@ from datetime import datetime
 import math
 
 from .geo_utils import distance_meters, is_point_in_polygon
+from f2c.access.geo_scope_validate import FORCE_USER_ROLES_FOR_GEO_SCOPE_FLAG
 
 
 @frappe.whitelist(allow_guest=True)
@@ -93,49 +94,127 @@ def _geo_fencing_area_exists():
     return frappe.db.exists("DocType", "Geo Fencing Area")
 
 
+def _gfa_is_farm(row):
+    return (row.get("geo_fencing_type") or "").strip() == "Farm"
+
+
+def _gfa_is_root_flag(row):
+    try:
+        return int(row.get("is_root") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 @frappe.whitelist()
 def get_geo_fencing_hierarchy():
     """
     Return Farm -> Cluster -> Field tree for the frontend.
     If Geo Fencing Area doctype does not exist, return { "farms": [] }.
+
+    Root farms are:
+    - Rows with geo_fencing_type Farm and no parent (or parent not in the result set), or
+    - Rows with geo_fencing_type Farm and is_root set (when the field exists), so extra farm
+      sites are not dropped when parent_area points at another farm.
+
+    Farms whose parent is also a Farm (and not promoted by is_root) are nested under
+    ``child_farms`` on the parent.
+
+    Farms whose parent is a Cluster/Field/Block (or any non-Farm in this tree) are appended
+    as extra root entries so a second farm like ``Farm2`` is never dropped.
     """
     if not _geo_fencing_area_exists():
         return {"farms": []}
     type_names = ["Farm", "Cluster", "Field", "Block"]
+    fields = ["name", "area_name", "geo_fencing_type", "parent_area"]
+    try:
+        if frappe.get_meta("Geo Fencing Area").has_field("is_root"):
+            fields.append("is_root")
+    except Exception:
+        pass
     areas = frappe.get_all(
         "Geo Fencing Area",
         filters={"geo_fencing_type": ["in", type_names]},
-        fields=["name", "area_name", "geo_fencing_type", "parent_area"],
+        fields=fields,
         order_by="area_name",
+        limit_page_length=0,
     )
     by_name = {a["name"]: a for a in areas}
     for a in areas:
         a.setdefault("clusters", [])
         a.setdefault("fields", [])
         a.setdefault("blocks", [])
-    roots = []
+        a.setdefault("child_farms", [])
+    # Attach Cluster / Block / Field under their parent area
     for a in areas:
-        parent_name = a.get("parent_area")
+        parent_name = (a.get("parent_area") or "").strip()
         if not parent_name or parent_name not in by_name:
-            if a["geo_fencing_type"] == "Farm":
-                roots.append(a)
-        else:
-            parent = by_name[parent_name]
-            if a["geo_fencing_type"] == "Cluster":
-                parent.setdefault("clusters", []).append(a)
-            elif a["geo_fencing_type"] == "Block":
-                parent.setdefault("blocks", []).append(a)
-            elif a["geo_fencing_type"] == "Field":
-                parent.setdefault("fields", []).append(a)
-    farms = []
+            continue
+        parent = by_name[parent_name]
+        gtype = (a.get("geo_fencing_type") or "").strip()
+        if gtype == "Cluster":
+            parent.setdefault("clusters", []).append(a)
+        elif gtype == "Block":
+            parent.setdefault("blocks", []).append(a)
+        elif gtype == "Field":
+            parent.setdefault("fields", []).append(a)
+
+    roots = []
+    root_names = set()
+    for a in areas:
+        if not _gfa_is_farm(a):
+            continue
+        parent_name = (a.get("parent_area") or "").strip()
+        if _gfa_is_root_flag(a):
+            roots.append(a)
+            root_names.add(a["name"])
+            continue
+        if not parent_name or parent_name not in by_name:
+            roots.append(a)
+            root_names.add(a["name"])
+
+    # Nest Farm -> Farm (child is not already a root and not is_root)
+    for a in areas:
+        if not _gfa_is_farm(a) or a["name"] in root_names:
+            continue
+        if _gfa_is_root_flag(a):
+            continue
+        parent_name = (a.get("parent_area") or "").strip()
+        if not parent_name or parent_name not in by_name:
+            continue
+        parent = by_name[parent_name]
+        if not _gfa_is_farm(parent):
+            continue
+        parent.setdefault("child_farms", []).append(a)
+
+    # Farms whose parent is Cluster/Field/Block (not Farm) were skipped above — promote them as roots
+    # so every Farm-type Geo Fencing Area appears (e.g. second farm under same project).
+    nested_farm_names = set()
+
+    def _collect_nested_farm_names(node):
+        for cf in node.get("child_farms") or []:
+            nested_farm_names.add(cf.get("name"))
+            _collect_nested_farm_names(cf)
+
     for r in roots:
-        def cluster_fields(c):
-            direct = c.get("fields", [])
-            from_blocks = []
-            for b in c.get("blocks", []):
-                from_blocks.extend(b.get("fields", []))
-            return direct + from_blocks
-        farms.append({
+        _collect_nested_farm_names(r)
+
+    for a in areas:
+        if not _gfa_is_farm(a):
+            continue
+        if a["name"] in root_names or a["name"] in nested_farm_names:
+            continue
+        roots.append(a)
+        root_names.add(a["name"])
+
+    def cluster_fields(c):
+        direct = c.get("fields", [])
+        from_blocks = []
+        for b in c.get("blocks", []):
+            from_blocks.extend(b.get("fields", []))
+        return direct + from_blocks
+
+    def serialize_farm(r):
+        out = {
             "name": r["name"],
             "area_name": r.get("area_name") or r["name"],
             "clusters": [
@@ -149,7 +228,13 @@ def get_geo_fencing_hierarchy():
                 }
                 for c in r.get("clusters", [])
             ],
-        })
+        }
+        child_farms = r.get("child_farms") or []
+        if child_farms:
+            out["child_farms"] = [serialize_farm(cf) for cf in child_farms]
+        return out
+
+    farms = [serialize_farm(r) for r in roots]
     return {"farms": farms}
 
 
@@ -1712,8 +1797,178 @@ def create_employee(first_name, last_name, email, password, designation, gender,
     return employee.as_dict()
 
 
+# Operational roles offered by the attendance portal Edit Employee UI (must match Role.name when assigned).
+ATTENDANCE_PORTAL_OPERATIONAL_ROLE_NAMES = frozenset({
+    "Field Supervisor",
+    "Cluster Supervisor",
+    "Farm Manager",
+    "Project Manager",
+    "Administrator",
+    "Finance Head",
+    "CEO/Operational Head",
+    "Driver",
+})
+# Desk / portal roles created via Add Employee — always preserved when merging operational roles.
+ATTENDANCE_PORTAL_DESK_ROLE_NAMES = frozenset({"Employee", "Manager", "HR Admin"})
+# HR Admin must not assign these via the portal (System Manager may assign a wider set).
+ATTENDANCE_PORTAL_ROLE_ASSIGN_BLOCKLIST_HR = frozenset({
+    "System Manager",
+    "Administrator",
+    "All",
+    "Guest",
+})
+
+# Named roles that always may load/assign portal-controlled User roles (broad HR access).
+_PORTAL_USER_ROLES_GATE_BY_ROLE = frozenset({
+    "HR Admin",
+    "HR Manager",
+    "HR User",
+    "System Manager",
+})
+
+
+def _portal_session_may_edit_employees_via_named_roles():
+    if frappe.session.user == "Administrator":
+        return True
+    return bool(_PORTAL_USER_ROLES_GATE_BY_ROLE & set(frappe.get_roles(frappe.session.user)))
+
+
+def _portal_may_manage_linked_user_roles(user_id):
+    """
+    True if this session may read/update User.roles data for ``user_id`` in the portal.
+
+    Allows standard HR roles plus anyone Frappe grants **write** on the Employee linked to
+    that user (covers custom HR roles without hard-coding every Role name).
+    """
+    if _portal_session_may_edit_employees_via_named_roles():
+        return True
+    u = (user_id or "").strip() if isinstance(user_id, str) else ""
+    if not u:
+        return False
+    employee_name = frappe.db.get_value("Employee", {"user_id": u}, "name")
+    if not employee_name:
+        return False
+    return frappe.has_permission("Employee", "write", employee_name)
+
+
+def _portal_may_update_employee_record(employee_name):
+    if _portal_session_may_edit_employees_via_named_roles():
+        return True
+    if not employee_name:
+        return False
+    return frappe.has_permission("Employee", "write", employee_name)
+
+
 @frappe.whitelist()
-def update_employee(employee_id, first_name, last_name, email, designation, reports_to, status, office=None, offices=None, allowed_farm_fields=None, company=None, password=None, holiday_list=None):
+def get_user_roles_for_employee_edit(user_id=None):
+    """
+    Return role names assigned to a User (for Edit Employee checkboxes).
+
+    Reads ``Has Role`` with ignore_permissions so HR Admin still receives roles when the
+    standard REST User document omits or strips the ``roles`` child table.
+    """
+    if not _portal_may_manage_linked_user_roles(user_id):
+        frappe.throw(
+            _("Not permitted to load roles for this user."),
+            frappe.PermissionError,
+        )
+    if not user_id or not isinstance(user_id, str):
+        return {"roles": []}
+    user_id = user_id.strip()
+    if not user_id or not frappe.db.exists("User", user_id):
+        return {"roles": []}
+    rows = frappe.get_all(
+        "Has Role",
+        filters={"parenttype": "User", "parent": user_id},
+        pluck="role",
+        order_by="creation asc",
+        ignore_permissions=True,
+    )
+    seen = set()
+    out = []
+    for r in rows or []:
+        role = (r or "").strip()
+        if not role or role in seen:
+            continue
+        seen.add(role)
+        out.append(role)
+    return {"roles": out}
+
+
+def _parse_str_list_param(val):
+    """Parse optional API list param from list or JSON string."""
+    if val is None:
+        return None
+    if isinstance(val, str):
+        s = (val or "").strip()
+        if not s:
+            return []
+        try:
+            parsed = json.loads(s)
+        except (json.JSONDecodeError, TypeError):
+            return []
+        if isinstance(parsed, list):
+            return [str(x).strip() for x in parsed if str(x).strip()]
+        return []
+    if isinstance(val, list):
+        return [str(x).strip() for x in val if str(x).strip()]
+    return []
+
+
+def _merge_user_roles_for_update_employee(user_doc, selected_roles, session_user):
+    """
+    Apply User role selection from the Edit Employee portal.
+
+    ``selected_roles`` should list desk roles (Employee, Manager, HR Admin) and operational
+    roles (Field Supervisor, Driver, etc.). If no desk role is included in the list (legacy
+    clients), desk roles are taken from the user's existing roles instead.
+    """
+    existing = {r.role for r in (user_doc.roles or []) if getattr(r, "role", None)}
+    other_kept = existing - ATTENDANCE_PORTAL_OPERATIONAL_ROLE_NAMES - ATTENDANCE_PORTAL_DESK_ROLE_NAMES
+
+    is_system_manager = "System Manager" in frappe.get_roles(session_user)
+
+    controlled_desk = set()
+    for role in selected_roles:
+        r = (role or "").strip()
+        if r in ATTENDANCE_PORTAL_DESK_ROLE_NAMES:
+            if not frappe.db.exists("Role", r):
+                frappe.throw(_("Role '{0}' does not exist").format(r))
+            controlled_desk.add(r)
+
+    if not controlled_desk:
+        controlled_desk = existing & ATTENDANCE_PORTAL_DESK_ROLE_NAMES
+
+    controlled_op = []
+    for role in selected_roles:
+        r = (role or "").strip()
+        if r in ATTENDANCE_PORTAL_DESK_ROLE_NAMES:
+            continue
+        if r not in ATTENDANCE_PORTAL_OPERATIONAL_ROLE_NAMES:
+            frappe.throw(
+                _("Invalid role: {0}. Must be Employee, Manager, HR Admin, or an operational role from the portal list.").format(r)
+            )
+        if not frappe.db.exists("Role", r):
+            frappe.throw(_("Role '{0}' does not exist. Create it in Role or run F2C seed.").format(r))
+        if not is_system_manager and r in ATTENDANCE_PORTAL_ROLE_ASSIGN_BLOCKLIST_HR:
+            continue
+        controlled_op.append(r)
+
+    final = set(controlled_op) | controlled_desk | other_kept
+    if user_doc.name != "Administrator" and "Employee" not in final:
+        if frappe.db.exists("Role", "Employee"):
+            final.add("Employee")
+
+    if not is_system_manager:
+        final -= ATTENDANCE_PORTAL_ROLE_ASSIGN_BLOCKLIST_HR
+
+    user_doc.roles = []
+    for role in sorted(final):
+        user_doc.append("roles", {"role": role})
+
+
+@frappe.whitelist()
+def update_employee(employee_id, first_name, last_name, email, designation, reports_to, status, office=None, offices=None, allowed_farm_fields=None, company=None, password=None, holiday_list=None, roles=None):
     """
     Update Employee and User details.
     
@@ -1722,10 +1977,12 @@ def update_employee(employee_id, first_name, last_name, email, designation, repo
         offices: List of office location names (optional, for multiple locations)
         office: Single office location name (optional, for backward compatibility)
         company: Company name (optional, to change employee's company)
+        roles: Optional list of role names from the Edit Employee UI: desk roles (Employee, Manager, HR Admin)
+            plus operational roles (Field Supervisor, Driver, etc.). When provided, these replace the previous
+            portal-controlled roles; other roles on the User (e.g. Report Manager) are kept.
     """
-    # Check permissions
-    if "HR Admin" not in frappe.get_roles(frappe.session.user):
-        frappe.throw(_("Not authorized"))
+    if not _portal_may_update_employee_record(employee_id):
+        frappe.throw(_("Not permitted to update this employee."), frappe.PermissionError)
 
     # 1. Update Employee
     employee = frappe.get_doc("Employee", employee_id)
@@ -1791,23 +2048,50 @@ def update_employee(employee_id, first_name, last_name, email, designation, repo
         else:  # Empty string means clear the holiday_list
             employee.holiday_list = None
 
+    roles_list = _parse_str_list_param(roles)
+    if (
+        roles_list is not None
+        and employee.user_id
+        and employee.user_id != "Administrator"
+    ):
+        # Merge roles in memory before Employee.save so F2C geo hooks validate against the
+        # portal selection (User DB roles are still the previous set until user.save below).
+        # This doc is only for computing the flag; Employee.on_update will save User again — we
+        # reload User from DB after employee.save() before applying portal changes.
+        role_preview_user = frappe.get_doc("User", employee.user_id)
+        role_preview_user.first_name = first_name
+        role_preview_user.last_name = last_name
+        role_preview_user.email = email
+        if password:
+            role_preview_user.new_password = password
+        _merge_user_roles_for_update_employee(role_preview_user, roles_list, frappe.session.user)
+        setattr(
+            frappe.flags,
+            FORCE_USER_ROLES_FOR_GEO_SCOPE_FLAG,
+            [r.role for r in (role_preview_user.roles or []) if getattr(r, "role", None)],
+        )
+
     try:
         employee.save(ignore_permissions=True)
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Attendance Portal update_employee (save)")
         raise
+    finally:
+        setattr(frappe.flags, FORCE_USER_ROLES_FOR_GEO_SCOPE_FLAG, None)
 
     # 2. Update User
     if employee.user_id:
+        # Employee.on_update() runs update_user() which does user.save() on a fresh User doc.
+        # Never reuse the pre-employee-save User object here — it will hit TimestampMismatchError.
         user = frappe.get_doc("User", employee.user_id)
         user.first_name = first_name
         user.last_name = last_name
-        # Skip updating email for Administrator (system user may not use email format)
         if employee.user_id != "Administrator":
             user.email = email
-
         if password:
             user.new_password = password
+        if roles_list is not None and user.name != "Administrator":
+            _merge_user_roles_for_update_employee(user, roles_list, frappe.session.user)
 
         try:
             user.save(ignore_permissions=True)
