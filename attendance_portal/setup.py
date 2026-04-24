@@ -97,7 +97,13 @@ def after_migrate():
                 "fieldtype": "Table",
                 "options": "Employee Allowed Geo Area",
                 "insert_after": "allowed_locations",
-                "description": "Farm land (Geo Fencing Area) fields where this employee can mark attendance. Only Field-level areas are used for punch check."
+                "description": (
+                    "Field Supervisor: use Add Row to assign one or more Field-level Geo Fencing Areas (each row is a root). "
+                    "Cluster Supervisor / Driver: use Add Row to assign one or more Cluster-level Geo Fencing Areas (each row is a root). "
+                    "Farm Manager: assign Farm, Cluster, or Field level areas (each row is a root). "
+                    "Sub-areas inherit access. Only System Manager, Administrator, or Project Manager may edit this table for users with those scoped roles. "
+                    "For attendance punch-in on farm land, Field-level areas are used where applicable."
+                ),
             }
         ],
         "Leave Application": [
