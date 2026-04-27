@@ -1792,13 +1792,17 @@ ATTENDANCE_PORTAL_OPERATIONAL_ROLE_NAMES = frozenset({
     "Cluster Supervisor",
     "Farm Manager",
     "Project Manager",
-    "Administrator",
-    "Finance Head",
-    "CEO/Operational Head",
     "Driver",
 })
-# Desk / portal roles created via Add Employee — always preserved when merging operational roles.
-ATTENDANCE_PORTAL_DESK_ROLE_NAMES = frozenset({"Employee", "Manager", "HR Admin"})
+# Desk / portal roles (HR / exec titles shown with Employee, Manager, HR Admin in the portal).
+ATTENDANCE_PORTAL_DESK_ROLE_NAMES = frozenset({
+    "Employee",
+    "Manager",
+    "HR Admin",
+    "Finance Head",
+    "CEO/Operational Head",
+    "Administrator",
+})
 # HR Admin must not assign these via the portal (System Manager may assign a wider set).
 ATTENDANCE_PORTAL_ROLE_ASSIGN_BLOCKLIST_HR = frozenset({
     "System Manager",
@@ -1908,9 +1912,9 @@ def _merge_user_roles_for_update_employee(user_doc, selected_roles, session_user
     """
     Apply User role selection from the Edit Employee portal.
 
-    ``selected_roles`` should list desk roles (Employee, Manager, HR Admin) and operational
-    roles (Field Supervisor, Driver, etc.). If no desk role is included in the list (legacy
-    clients), desk roles are taken from the user's existing roles instead.
+    ``selected_roles`` should list desk roles (Employee, Manager, HR Admin, Finance Head, etc.)
+    and operational roles (Field Supervisor, Driver, etc.). If no desk role is included in the
+    list (legacy clients), desk roles are taken from the user's existing roles instead.
     """
     existing = {r.role for r in (user_doc.roles or []) if getattr(r, "role", None)}
     other_kept = existing - ATTENDANCE_PORTAL_OPERATIONAL_ROLE_NAMES - ATTENDANCE_PORTAL_DESK_ROLE_NAMES
@@ -1923,6 +1927,8 @@ def _merge_user_roles_for_update_employee(user_doc, selected_roles, session_user
         if r in ATTENDANCE_PORTAL_DESK_ROLE_NAMES:
             if not frappe.db.exists("Role", r):
                 frappe.throw(_("Role '{0}' does not exist").format(r))
+            if not is_system_manager and r in ATTENDANCE_PORTAL_ROLE_ASSIGN_BLOCKLIST_HR:
+                continue
             controlled_desk.add(r)
 
     if not controlled_desk:
@@ -1935,7 +1941,7 @@ def _merge_user_roles_for_update_employee(user_doc, selected_roles, session_user
             continue
         if r not in ATTENDANCE_PORTAL_OPERATIONAL_ROLE_NAMES:
             frappe.throw(
-                _("Invalid role: {0}. Must be Employee, Manager, HR Admin, or an operational role from the portal list.").format(r)
+                _("Invalid role: {0}. Must be a desk role or an operational role from the portal list.").format(r)
             )
         if not frappe.db.exists("Role", r):
             frappe.throw(_("Role '{0}' does not exist. Create it in Role or run F2C seed.").format(r))
@@ -1966,8 +1972,8 @@ def update_employee(employee_id, first_name, last_name, email, designation, repo
         offices: List of office location names (optional, for multiple locations)
         office: Single office location name (optional, for backward compatibility)
         company: Company name (optional, to change employee's company)
-        roles: Optional list of role names from the Edit Employee UI: desk roles (Employee, Manager, HR Admin)
-            plus operational roles (Field Supervisor, Driver, etc.). When provided, these replace the previous
+        roles: Optional list of role names from the Edit Employee UI: desk roles (Employee, Manager, HR Admin,
+            Finance Head, CEO/Operational Head, etc.) plus operational roles (Field Supervisor, Driver, etc.). When provided, these replace the previous
             portal-controlled roles; other roles on the User (e.g. Report Manager) are kept.
     """
     if not _portal_may_update_employee_record(employee_id):
