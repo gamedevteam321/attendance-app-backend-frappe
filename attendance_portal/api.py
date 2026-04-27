@@ -1678,41 +1678,30 @@ def get_employee_requests(doctype):
 def create_employee(first_name, last_name, email, password, designation, gender, date_of_birth, date_of_joining, company, reports_to, office=None, offices=None, allowed_farm_fields=None, roles=None, holiday_list=None):
     """
     Create a new User and Employee document.
-    
+
     Args:
-        roles: List of user roles - must include "Employee", can also include "Manager" and/or "HR Admin"
-              If not provided, defaults to ["Employee"]
+        roles: Optional list (or JSON string) of role names from the portal: desk roles
+            (Employee, Manager, HR Admin) plus operational roles (Field Supervisor, Driver, etc.).
+            Same rules as ``update_employee``. If omitted or empty, defaults to ``["Employee"]``.
         holiday_list: Holiday List name to assign to the employee (optional)
     """
     # Check permissions
     if "HR Admin" not in frappe.get_roles(frappe.session.user):
         frappe.throw(_("Not authorized"))
 
-    # Handle roles - default to Employee if not provided
     if roles is None:
-        roles = ["Employee"]
-    
-    # If roles is a string (single role), convert to list
-    if isinstance(roles, str):
-        roles = [roles]
-    
-    # Validate that Employee role is always included
-    if "Employee" not in roles:
-        roles.append("Employee")
-    
-    # Validate all roles
-    valid_roles = ["Employee", "Manager", "HR Admin"]
-    for role in roles:
-        if role not in valid_roles:
-            frappe.throw(_("Invalid role: {0}. Must be one of: Employee, Manager, HR Admin").format(role))
+        parsed_roles = ["Employee"]
+    else:
+        parsed_roles = _parse_str_list_param(roles)
+        if not parsed_roles:
+            parsed_roles = ["Employee"]
+        elif "Employee" not in parsed_roles:
+            parsed_roles = list(parsed_roles) + ["Employee"]
 
     # 1. Create User
     if frappe.db.exists("User", email):
         frappe.throw(_("User with this email already exists"))
-    
-    # Prepare roles for user assignment
-    roles_to_assign = [{"role": role} for role in set(roles)]  # Use set to remove duplicates
-        
+
     user = frappe.get_doc({
         "doctype": "User",
         "email": email,
@@ -1720,9 +1709,9 @@ def create_employee(first_name, last_name, email, password, designation, gender,
         "last_name": last_name,
         "send_welcome_email": 0,
         "enabled": 1,
-        "roles": roles_to_assign
     })
     user.new_password = password
+    _merge_user_roles_for_update_employee(user, parsed_roles, frappe.session.user)
     user.insert(ignore_permissions=True)
     
     # 2. Create Employee
